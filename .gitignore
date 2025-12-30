@@ -1,0 +1,71 @@
+# ===== OS / Editor =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# ===== IDE =====
+.github/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== Secrets / Env =====
+.env.*
+*.pem
+*.key
+*.crt
+
+# ===== Logs / Runtime =====
+logs/
+*.log
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtualenv
+.venv/
+venv/
+ENV/
+
+# Test / Coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Build / Packaging
+build/
+dist/
+*.egg-info/
+
+# ===== Node / Frontend =====
+node_modules/
+frontend/node_modules/
+
+# Vite / bundlers
+frontend/dist/
+dist/
+.vite/
+
+# TypeScript
+*.tsbuildinfo
+
+# ===== Docker / Compose =====
+*.pid
+
+# ===== Local data / uploads (if created during dev) =====
+uploads/
+backend/uploads/
+
+# ===== MinIO / OnlyOffice / other local volumes =====
+minio_data/
+onlyoffice_data/
+
+# ===== Jupyter (if used) =====
+.ipynb_checkpoints/

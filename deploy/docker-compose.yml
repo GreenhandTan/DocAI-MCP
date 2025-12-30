@@ -1,0 +1,135 @@
+services:
+  minio:
+    image: docker.1ms.run/minio/minio:RELEASE.2025-04-08T15-41-24Z
+    container_name: docai-minio
+    command: server /data --console-address ":9001"
+    env_file:
+      - .env
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  postgres:
+    image: docker.1ms.run/library/postgres:15-alpine
+    container_name: docai-postgres
+    env_file:
+      - .env
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: docker.1ms.run/library/redis:7-alpine
+    container_name: docai-redis
+    env_file:
+      - .env
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  onlyoffice:
+    image: docker.1ms.run/onlyoffice/documentserver:9.1
+    container_name: docai-onlyoffice
+    env_file:
+      - .env
+    environment:
+      JWT_ENABLED: "true"
+      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET}
+      JWT_HEADER: ${ONLYOFFICE_JWT_HEADER}
+    ports:
+      - "8081:80"
+    volumes:
+      - onlyoffice_data:/var/lib/onlyoffice
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/healthcheck"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+
+  backend:
+    build: ../backend
+    container_name: docai-backend
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_SERVER}:${POSTGRES_PORT}/${POSTGRES_DB}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET_UPLOADS: ${MINIO_BUCKET_UPLOADS}
+      MINIO_BUCKET_OUTPUTS: ${MINIO_BUCKET_OUTPUTS}
+      ONLYOFFICE_API_URL: ${ONLYOFFICE_API_URL}
+      ONLYOFFICE_PUBLIC_URL: ${ONLYOFFICE_PUBLIC_URL}
+      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET}
+      AI_API_KEY: ${AI_API_KEY}
+      AI_API_BASE_URL: ${AI_API_BASE_URL}
+      AI_MODEL_NAME: ${AI_MODEL_NAME}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mcp-server:
+    build: ../mcp-server
+    container_name: docai-mcp-server
+    env_file:
+      - .env
+    environment:
+      BACKEND_URL: http://backend:8000/api/v1
+      AI_API_KEY: ${AI_API_KEY}
+      AI_API_BASE_URL: ${AI_API_BASE_URL}
+      AI_MODEL_NAME: ${AI_MODEL_NAME}
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build: ../frontend
+    container_name: docai-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  minio_data:
+  postgres_data:
+  onlyoffice_data:
