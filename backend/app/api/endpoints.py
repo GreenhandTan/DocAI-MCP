@@ -8,11 +8,12 @@ from app.services.minio_client import minio_client
 from app.services.workflow import process_task_background
 from app.core.config import get_settings
 from starlette.concurrency import run_in_threadpool
-from zhipuai import ZhipuAI
 from pydantic import BaseModel
 import uuid
 import os
 from urllib.parse import quote
+import httpx
+import json
 
 router = APIRouter()
 settings = get_settings()
@@ -23,6 +24,7 @@ class TaskCreate(BaseModel):
     template_file_id: str | None = None
     preset_template: str | None = None
     requirements: str | None = None
+    ai_model: str | None = None
 
 class TaskResponse(BaseModel):
     task_id: str
@@ -51,6 +53,7 @@ class ChatRequest(BaseModel):
     file_ids: list[str] | None = None
     template_file_id: str | None = None
     preset_template: str | None = None
+    model: str | None = None
 
 class ChatResponse(BaseModel):
     reply: str
@@ -58,6 +61,21 @@ class ChatResponse(BaseModel):
 class ModifyRequest(BaseModel):
     file_id: str
     modifications: str
+    ai_model: str | None = None
+
+
+def _resolve_chat_completions_url() -> str:
+    url = (settings.AI_API_BASE_URL or "").strip()
+    if not url:
+        raise HTTPException(status_code=500, detail="AI_API_BASE_URL 未配置")
+    if url.endswith("/chat/completions"):
+        return url
+    return url.rstrip("/") + "/chat/completions"
+
+
+def _resolve_model(requested_model: str | None) -> str:
+    model = (requested_model or settings.AI_MODEL_NAME or "").strip()
+    return model or "glm4.7"
 
 @router.post("/files/upload")
 async def upload_file(
@@ -146,6 +164,7 @@ async def create_task(
         content_file_ids=[uuid.UUID(fid) for fid in task_in.content_file_ids],
         template_file_id=uuid.UUID(task_in.template_file_id) if task_in.template_file_id else None,
         requirements=task_in.requirements,
+        ai_model=task_in.ai_model,
         status="pending"
     )
     
@@ -153,7 +172,7 @@ async def create_task(
     await db.commit()
     await db.refresh(new_task)
     
-    background_tasks.add_task(process_task_background, str(new_task.id), task_in.preset_template)
+    background_tasks.add_task(process_task_background, str(new_task.id), task_in.preset_template, None, task_in.ai_model)
     
     return TaskResponse(task_id=str(new_task.id), status=new_task.status)
 
@@ -169,6 +188,7 @@ async def modify_document(
         task_type="modify_document",
         content_file_ids=[uuid.UUID(req.file_id)],
         requirements=req.modifications,
+        ai_model=req.ai_model,
         status="pending"
     )
     
@@ -176,7 +196,7 @@ async def modify_document(
     await db.commit()
     await db.refresh(new_task)
     
-    background_tasks.add_task(process_task_background, str(new_task.id), None, req.modifications)
+    background_tasks.add_task(process_task_background, str(new_task.id), None, req.modifications, req.ai_model)
     
     return TaskResponse(task_id=str(new_task.id), status=new_task.status)
 
@@ -221,8 +241,8 @@ async def ai_chat(payload: ChatRequest):
     if not settings.AI_API_KEY:
         raise HTTPException(status_code=500, detail="AI_API_KEY 未配置")
 
-    model = settings.AI_MODEL_NAME or "glm-4.5-air"
-    client = ZhipuAI(api_key=settings.AI_API_KEY)
+    url = _resolve_chat_completions_url()
+    model = _resolve_model(payload.model)
 
     user_text = payload.message.strip()
     if not user_text:
@@ -234,15 +254,19 @@ async def ai_chat(payload: ChatRequest):
         template_text = payload.template_file_id or payload.preset_template or "无"
         prompt = f"内容文档ID：{file_ids_text}\n模板文档ID：{template_text}\n用户需求：{user_text}\n请用中文给出可执行的处理方案与结果预期。"
 
-    def _call():
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            stream=False
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {settings.AI_API_KEY}"},
+            json={"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False},
         )
-        return resp.choices[0].message.content
-
-    reply = await run_in_threadpool(_call)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"AI 调用失败: {resp.status_code}: {resp.text}")
+        data = resp.json()
+        try:
+            reply = data["choices"][0]["message"]["content"]
+        except Exception:
+            raise HTTPException(status_code=502, detail=f"AI 返回格式异常: {data}")
     return ChatResponse(reply=reply)
 
 @router.post("/ai/chat/stream")
@@ -251,8 +275,8 @@ async def ai_chat_stream(payload: ChatRequest):
     if not settings.AI_API_KEY:
         raise HTTPException(status_code=500, detail="AI_API_KEY 未配置")
 
-    model = settings.AI_MODEL_NAME or "glm-4.5-air"
-    client = ZhipuAI(api_key=settings.AI_API_KEY)
+    url = _resolve_chat_completions_url()
+    model = _resolve_model(payload.model)
 
     user_text = payload.message.strip()
     if not user_text:
@@ -264,38 +288,58 @@ async def ai_chat_stream(payload: ChatRequest):
         template_text = payload.template_file_id or payload.preset_template or "无"
         prompt = f"内容文档ID：{file_ids_text}\n模板文档ID：{template_text}\n用户需求：{user_text}\n请用中文给出可执行的处理方案与结果预期。"
 
-    import json
-    
-    def generate():
+    async def generate():
+        yield f"data: {json.dumps({'type': 'thinking', 'content': '正在思考...'}, ensure_ascii=False)}\n\n"
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                stream=True
-            )
-            
-            for chunk in response:
-                if chunk.choices and len(chunk.choices) > 0:
-                    delta = chunk.choices[0].delta
-                    # 检查是否有思考过程（reasoning_content）
-                    if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                        yield f"data: {json.dumps({'type': 'thinking', 'content': delta.reasoning_content}, ensure_ascii=False)}\n\n"
-                    # 正常内容输出
-                    if hasattr(delta, 'content') and delta.content:
-                        yield f"data: {json.dumps({'type': 'content', 'content': delta.content}, ensure_ascii=False)}\n\n"
-            
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream(
+                    "POST",
+                    url,
+                    headers={"Authorization": f"Bearer {settings.AI_API_KEY}"},
+                    json={"model": model, "messages": [{"role": "user", "content": prompt}], "stream": True},
+                ) as resp:
+                    if resp.status_code >= 400:
+                        text = await resp.aread()
+                        raise RuntimeError(f"AI 调用失败: {resp.status_code}: {text.decode('utf-8', errors='ignore')}")
+
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+
+                        data_part = line[len("data:"):].strip()
+                        if data_part == "[DONE]":
+                            yield f"data: {json.dumps({'type': 'done', 'content': ''}, ensure_ascii=False)}\n\n"
+                            return
+
+                        try:
+                            event = json.loads(data_part)
+                        except Exception:
+                            continue
+
+                        delta = None
+                        try:
+                            delta = event.get("choices", [{}])[0].get("delta")
+                        except Exception:
+                            delta = None
+
+                        if isinstance(delta, dict):
+                            reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                            if reasoning:
+                                yield f"data: {json.dumps({'type': 'thinking', 'content': reasoning}, ensure_ascii=False)}\n\n"
+                            content = delta.get("content")
+                            if content:
+                                yield f"data: {json.dumps({'type': 'content', 'content': content}, ensure_ascii=False)}\n\n"
+
+                    yield f"data: {json.dumps({'type': 'done', 'content': ''}, ensure_ascii=False)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
 @router.get("/files/{file_id}/download")

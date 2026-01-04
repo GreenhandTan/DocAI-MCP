@@ -78,6 +78,13 @@ const isThinking = ref(false);
 const thinkingText = ref("");
 const messagesContainer = ref<HTMLElement | null>(null);
 
+// 模型选择
+const modelOptions = [
+  { id: "glm4.7", name: "glm4.7" },
+  { id: "minimax-m2.1", name: "minimax-m2.1" },
+];
+const selectedModel = ref<string>("glm4.7");
+
 // 模板相关
 const presetTemplates = [
   { id: "resume", name: "个人简历", icon: "📄" },
@@ -292,6 +299,7 @@ const sendMessage = async () => {
         file_ids: selectedFileIds.value,
         preset_template: selectedTemplate.value,
         template_file_id: customTemplateFile.value?.file_id,
+        model: selectedModel.value,
       }),
     });
 
@@ -350,6 +358,7 @@ const sendMessage = async () => {
       preset_template: selectedTemplate.value,
       template_file_id: customTemplateFile.value?.file_id,
       requirements: text,
+      ai_model: selectedModel.value,
     });
 
     // 添加任务创建成功的提示
@@ -988,20 +997,32 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <!-- 发送按钮 -->
-              <button
-                @click="sendMessage"
-                :disabled="!canSend"
-                class="w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 shadow-sm"
-                :class="
-                  canSend
-                    ? 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-500/30 hover:shadow-indigo-500/50 hover:-translate-y-0.5'
-                    : 'bg-slate-100 text-slate-300 cursor-not-allowed'
-                "
-              >
-                <Send v-if="!isSending" class="w-5 h-5 ml-0.5" />
-                <Loader2 v-else class="w-5 h-5 animate-spin" />
-              </button>
+              <div class="flex items-center gap-2">
+                <select
+                  v-model="selectedModel"
+                  class="h-10 px-3 rounded-xl border border-slate-200 bg-white text-slate-700 text-sm font-medium hover:bg-slate-50 transition-colors"
+                  title="选择模型"
+                >
+                  <option v-for="m in modelOptions" :key="m.id" :value="m.id">
+                    {{ m.name }}
+                  </option>
+                </select>
+
+                <!-- 发送按钮 -->
+                <button
+                  @click="sendMessage"
+                  :disabled="!canSend"
+                  class="w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 shadow-sm"
+                  :class="
+                    canSend
+                      ? 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-500/30 hover:shadow-indigo-500/50 hover:-translate-y-0.5'
+                      : 'bg-slate-100 text-slate-300 cursor-not-allowed'
+                  "
+                >
+                  <Send v-if="!isSending" class="w-5 h-5 ml-0.5" />
+                  <Loader2 v-else class="w-5 h-5 animate-spin" />
+                </button>
+              </div>
             </div>
           </div>
 

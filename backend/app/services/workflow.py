@@ -13,11 +13,12 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 class WorkflowOrchestrator:
-    def __init__(self, task_id: str, preset_template: str | None = None, modifications: str | None = None):
+    def __init__(self, task_id: str, preset_template: str | None = None, modifications: str | None = None, ai_model: str | None = None):
         self.task_id = task_id
         self.mcp_base_url = "http://mcp-server:3000/api/tools"
         self.preset_template = preset_template
         self.modifications = modifications
+        self.ai_model = ai_model
         
     async def run(self):
         async with SessionLocal() as db:
@@ -25,6 +26,9 @@ class WorkflowOrchestrator:
             if not task:
                 logger.error(f"Task {self.task_id} not found")
                 return
+
+            if not self.ai_model and getattr(task, "ai_model", None):
+                self.ai_model = task.ai_model
 
             try:
                 await self._update_status(db, "processing")
@@ -56,7 +60,8 @@ class WorkflowOrchestrator:
         if task.template_file_id:
             template_style = await self._call_tool("document_analyzer", {
                 "file_id": str(task.template_file_id), 
-                "analysis_type": "style"
+                "analysis_type": "style",
+                **({"ai_model": self.ai_model} if self.ai_model else {})
             })
         else:
             template_style = {}
@@ -64,14 +69,16 @@ class WorkflowOrchestrator:
         plan = await self._call_tool("template_matcher", {
             "content_file_ids": [str(f) for f in task.content_file_ids], 
             "template_file_id": str(task.template_file_id) if task.template_file_id else "none",
-            "keep_styles": True
+            "keep_styles": True,
+            **({"ai_model": self.ai_model} if self.ai_model else {})
         })
         
         result = await self._call_tool("document_generator", {
             "content": full_content,
             "template_file_id": str(task.template_file_id) if task.template_file_id else "none",
             "output_format": "docx",
-            "preset_template": self.preset_template
+            "preset_template": self.preset_template,
+            **({"ai_model": self.ai_model} if self.ai_model else {})
         })
         
         logger.info(f"Document generator result: {result}")
@@ -103,7 +110,8 @@ class WorkflowOrchestrator:
         
         result = await self._call_tool("document_modifier", {
             "file_id": file_id,
-            "modifications": self.modifications or task.requirements or "请根据需求修改文档"
+            "modifications": self.modifications or task.requirements or "请根据需求修改文档",
+            **({"ai_model": self.ai_model} if self.ai_model else {})
         })
         
         logger.info(f"Document modifier result: {result}")
@@ -143,6 +151,6 @@ class WorkflowOrchestrator:
         await db.execute(stmt)
         await db.commit()
 
-async def process_task_background(task_id: str, preset_template: str | None = None, modifications: str | None = None):
-    orchestrator = WorkflowOrchestrator(task_id, preset_template, modifications)
+async def process_task_background(task_id: str, preset_template: str | None = None, modifications: str | None = None, ai_model: str | None = None):
+    orchestrator = WorkflowOrchestrator(task_id, preset_template, modifications, ai_model)
     await orchestrator.run()

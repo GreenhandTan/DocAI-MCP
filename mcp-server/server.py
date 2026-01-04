@@ -1,6 +1,5 @@
 from mcp.server.fastmcp import FastMCP
 from fastapi import FastAPI, HTTPException
-from zhipuai import ZhipuAI
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -16,28 +15,47 @@ mcp = FastMCP("docai-mcp")
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000/api/v1")
 AI_API_KEY = os.getenv("AI_API_KEY")
-AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", "glm-4.5-air")
+AI_API_BASE_URL = os.getenv("AI_API_BASE_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
+AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", "glm4.7")
 
 class AIClient:
     def __init__(self):
-        self.client = None
-        if AI_API_KEY and "此处" not in AI_API_KEY:
-            self.client = ZhipuAI(api_key=AI_API_KEY)
+        self.api_key = (AI_API_KEY or "").strip()
+        self.api_url = (AI_API_BASE_URL or "").strip()
         self.model = AI_MODEL_NAME
+
+    def _resolve_url(self) -> str:
+        if not self.api_url:
+            return ""
+        if self.api_url.endswith("/chat/completions"):
+            return self.api_url
+        return self.api_url.rstrip("/") + "/chat/completions"
+
+    def _resolve_model(self, override_model: str | None) -> str:
+        model = (override_model or self.model or "").strip()
+        return model or "glm4.7"
         
-    def generate_completion(self, prompt: str):
-        if not self.client:
+    def generate_completion(self, prompt: str, model: str | None = None):
+        url = self._resolve_url()
+        if not self.api_key or not url:
             return f"Mock AI Response (Key Missing): {prompt[:50]}..."
-            
+
+        selected_model = self._resolve_model(model)
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                stream=False
-            )
-            return response.choices[0].message.content
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json={
+                        "model": selected_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False,
+                    },
+                )
+                if resp.status_code >= 400:
+                    return f"AI Error: {resp.status_code}: {resp.text}"
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
         except Exception as e:
             print(f"AI Error: {e}")
             return f"AI Error: {str(e)}"
@@ -86,7 +104,7 @@ def set_chinese_font(run, font_name='微软雅黑', size=12, bold=False, color=N
     if color:
         run.font.color.rgb = color
 
-def parse_ai_content_for_template(content: str, template_type: str) -> dict:
+def parse_ai_content_for_template(content: str, template_type: str, ai_model: str | None = None) -> dict:
     """使用AI解析内容并提取结构化数据用于填充模板"""
     template_prompts = {
         'resume': """请从以下内容中提取简历信息，以JSON格式返回：
@@ -174,7 +192,7 @@ def parse_ai_content_for_template(content: str, template_type: str) -> dict:
         return {"raw_content": content}
     
     full_prompt = prompt + content
-    ai_response = ai_client.generate_completion(full_prompt)
+    ai_response = ai_client.generate_completion(full_prompt, model=ai_model)
     
     try:
         # 提取JSON
@@ -187,13 +205,13 @@ def parse_ai_content_for_template(content: str, template_type: str) -> dict:
         print(f"Failed to parse AI response as JSON: {ai_response[:200]}")
         return {"raw_content": content}
 
-def create_document_from_content(content: str, template_type: str = 'default') -> bytes:
+def create_document_from_content(content: str, template_type: str = 'default', ai_model: str | None = None) -> bytes:
     """根据内容和模板类型创建文档，使用AI解析内容填充模板"""
     doc = Document()
     
     # 如果有实际内容，使用AI解析并填充
     if content and content.strip() and template_type != 'default':
-        parsed_data = parse_ai_content_for_template(content, template_type)
+        parsed_data = parse_ai_content_for_template(content, template_type, ai_model=ai_model)
         
         if template_type == 'resume':
             title = parsed_data.get('title', '个人简历')
@@ -439,7 +457,7 @@ def create_document_from_content(content: str, template_type: str = 'default') -
     doc.save(output)
     return output.getvalue()
 
-def modify_document_with_content(original_content: bytes, modifications: str) -> bytes:
+def modify_document_with_content(original_content: bytes, modifications: str, ai_model: str | None = None) -> bytes:
     try:
         doc = Document(io.BytesIO(original_content))
         
@@ -457,7 +475,7 @@ def modify_document_with_content(original_content: bytes, modifications: str) ->
         }}
         """
         
-        ai_response = ai_client.generate_completion(prompt)
+        ai_response = ai_client.generate_completion(prompt, model=ai_model)
         
         try:
             if "```json" in ai_response:
@@ -497,7 +515,7 @@ def modify_document_with_content(original_content: bytes, modifications: str) ->
         print(f"Error modifying document: {e}")
         return original_content
 
-async def _analyze_document_logic(file_id: str, analysis_type: str):
+async def _analyze_document_logic(file_id: str, analysis_type: str, ai_model: str | None = None):
     file_content = await download_file_from_backend(file_id)
     
     if not file_content:
@@ -514,7 +532,7 @@ async def _analyze_document_logic(file_id: str, analysis_type: str):
     请以 JSON 格式返回结果。
     """
     
-    ai_response = ai_client.generate_completion(prompt)
+    ai_response = ai_client.generate_completion(prompt, model=ai_model)
     
     try:
         if "```json" in ai_response:
@@ -547,7 +565,7 @@ async def _extract_content_logic(file_id: str, format: str):
     except Exception as e:
         return f"提取内容失败：{str(e)}"
 
-async def _match_template_logic(content_file_ids: list[str], template_file_id: str, keep_styles: bool):
+async def _match_template_logic(content_file_ids: list[str], template_file_id: str, keep_styles: bool, ai_model: str | None = None):
     prompt = f"""
     我有内容文件：{content_file_ids}
     和模板文件：{template_file_id}
@@ -556,7 +574,7 @@ async def _match_template_logic(content_file_ids: list[str], template_file_id: s
     请提供合并策略计划，以 JSON 格式返回。
     """
     
-    ai_response = ai_client.generate_completion(prompt)
+    ai_response = ai_client.generate_completion(prompt, model=ai_model)
     try:
         if "```json" in ai_response:
             ai_response = ai_response.split("```json")[1].split("```")[0].strip()
@@ -564,7 +582,7 @@ async def _match_template_logic(content_file_ids: list[str], template_file_id: s
     except:
         return {"plan": ai_response}
 
-async def _generate_document_logic(content: str, template_file_id: str, output_format: str, preset_template: str | None = None) -> dict:
+async def _generate_document_logic(content: str, template_file_id: str, output_format: str, preset_template: str | None = None, ai_model: str | None = None) -> dict:
     template_type = 'default'
     
     if preset_template:
@@ -585,7 +603,7 @@ async def _generate_document_logic(content: str, template_file_id: str, output_f
     print(f"Generating document: template_type={template_type}, content_length={len(content) if content else 0}")
     
     try:
-        doc_content = create_document_from_content(content, template_type)
+        doc_content = create_document_from_content(content, template_type, ai_model=ai_model)
         
         import time
         timestamp = int(time.time())
@@ -598,14 +616,14 @@ async def _generate_document_logic(content: str, template_file_id: str, output_f
         print(error_msg)
         return {"error": error_msg}
 
-async def _modify_document_logic(file_id: str, modifications: str) -> dict:
+async def _modify_document_logic(file_id: str, modifications: str, ai_model: str | None = None) -> dict:
     file_content = await download_file_from_backend(file_id)
     
     if not file_content:
         return {"error": "Failed to download document for modification"}
     
     try:
-        modified_content = modify_document_with_content(file_content, modifications)
+        modified_content = modify_document_with_content(file_content, modifications, ai_model=ai_model)
         
         import time
         timestamp = int(time.time())
@@ -720,16 +738,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 @app.post("/api/tools/{name}/invoke")
 async def invoke_tool(name: str, arguments: dict):
+    ai_model = arguments.get("ai_model")
     if name == "document_analyzer":
-        return await _analyze_document_logic(arguments["file_id"], arguments.get("analysis_type", "structure"))
+        return await _analyze_document_logic(arguments["file_id"], arguments.get("analysis_type", "structure"), ai_model=ai_model)
     elif name == "content_extractor":
         return {"content": await _extract_content_logic(arguments["file_id"], arguments.get("format", "markdown"))}
     elif name == "template_matcher":
-        return await _match_template_logic(arguments["content_file_ids"], arguments["template_file_id"], arguments.get("keep_styles", True))
+        return await _match_template_logic(arguments["content_file_ids"], arguments["template_file_id"], arguments.get("keep_styles", True), ai_model=ai_model)
     elif name == "document_generator":
-        return await _generate_document_logic(arguments["content"], arguments["template_file_id"], arguments.get("output_format", "docx"), arguments.get("preset_template"))
+        return await _generate_document_logic(arguments["content"], arguments["template_file_id"], arguments.get("output_format", "docx"), arguments.get("preset_template"), ai_model=ai_model)
     elif name == "document_modifier":
-        return await _modify_document_logic(arguments["file_id"], arguments["modifications"])
+        return await _modify_document_logic(arguments["file_id"], arguments["modifications"], ai_model=ai_model)
     raise HTTPException(status_code=404, detail="Tool not found")
 
 if __name__ == "__main__":

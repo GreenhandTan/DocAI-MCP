@@ -5,6 +5,7 @@ services:
     command: server /data --console-address ":9001"
     env_file:
       - .env
+      - .env.local
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -21,6 +22,7 @@ services:
     container_name: docai-postgres
     env_file:
       - .env
+      - .env.local
     ports:
       - "5432:5432"
     volumes:
@@ -36,6 +38,7 @@ services:
     container_name: docai-redis
     env_file:
       - .env
+      - .env.local
     ports:
       - "6379:6379"
     healthcheck:
@@ -49,6 +52,7 @@ services:
     container_name: docai-onlyoffice
     env_file:
       - .env
+      - .env.local
     environment:
       JWT_ENABLED: "true"
       JWT_SECRET: ${ONLYOFFICE_JWT_SECRET}
@@ -68,6 +72,7 @@ services:
     container_name: docai-backend
     env_file:
       - .env
+      - .env.local
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_SERVER}:${POSTGRES_PORT}/${POSTGRES_DB}
       MINIO_ENDPOINT: ${MINIO_ENDPOINT}
@@ -101,6 +106,7 @@ services:
     container_name: docai-mcp-server
     env_file:
       - .env
+      - .env.local
     environment:
       BACKEND_URL: http://backend:8000/api/v1
       AI_API_KEY: ${AI_API_KEY}
