@@ -49,8 +49,13 @@ class TaskListItem(BaseModel):
     error: str | None = None
     created_at: str | None = None
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
     message: str
+    history: list[ChatMessage] | None = None
     file_ids: list[str] | None = None
     template_file_id: str | None = None
     preset_template: str | None = None
@@ -302,22 +307,36 @@ async def ai_chat_stream(payload: ChatRequest, db: AsyncSession = Depends(get_db
                     if resp.status_code == 200:
                         data = resp.json()
                         content = data.get("content", "")
-                        if content and not content.startswith("无法") and not content.startswith("提取"):
-                            file_contents.append(f"【文档内容】:\n{content[:3000]}")  # 限制长度
+                        if content:
+                            # 移除 "无法" 检查，允许错误信息传递给 AI，以便 AI 解释原因
+                            file_contents.append(f"【文档内容】:\n{content}")
             except Exception as e:
                 file_contents.append(f"【文档 {file_id}】: 内容提取失败 - {str(e)}")
 
-    # 构建提示词
-    prompt = user_text
+    # 构建消息列表
+    messages = []
+    
+    # 1. 系统消息（包含文档内容）
+    system_content = "你是一个智能文档助手。请根据用户提供的文档内容和需求进行回答。"
     if file_contents:
         docs_text = "\n\n".join(file_contents)
         template_text = payload.preset_template or "无"
-        prompt = f"以下是用户上传的文档内容：\n\n{docs_text}\n\n用户选择的模板类型：{template_text}\n\n用户需求：{user_text}\n\n请根据文档内容和用户需求，用中文给出详细的处理方案和结果预期。"
+        system_content += f"\n\n以下是用户上传的文档内容：\n\n{docs_text}\n\n用户选择的模板类型：{template_text}"
     elif payload.file_ids:
-        # 文件 ID 存在但内容提取失败
         file_ids_text = ", ".join(payload.file_ids)
-        template_text = payload.preset_template or "无"
-        prompt = f"用户上传了文档（ID: {file_ids_text}），但内容提取失败。\n模板类型：{template_text}\n用户需求：{user_text}\n\n请提示用户重新上传文档或检查文档格式。"
+        system_content += f"\n\n用户上传了文档（ID: {file_ids_text}），但内容提取失败。请提示用户检查文档。"
+        
+    messages.append({"role": "system", "content": system_content})
+    
+    # 2. 历史消息
+    if payload.history:
+        for msg in payload.history:
+            # 过滤掉空消息或思考过程
+            if msg.content:
+                messages.append({"role": msg.role, "content": msg.content})
+            
+    # 3. 当前用户消息
+    messages.append({"role": "user", "content": user_text})
 
     async def generate():
         yield f"data: {json.dumps({'type': 'thinking', 'content': '正在思考...'}, ensure_ascii=False)}\n\n"
@@ -329,7 +348,7 @@ async def ai_chat_stream(payload: ChatRequest, db: AsyncSession = Depends(get_db
                     "POST",
                     url,
                     headers={"Authorization": f"Bearer {settings.AI_API_KEY}"},
-                    json={"model": model, "messages": [{"role": "user", "content": prompt}], "stream": True},
+                    json={"model": model, "messages": messages, "stream": True},
                 ) as resp:
                     if resp.status_code >= 400:
                         text = await resp.aread()
@@ -392,7 +411,9 @@ async def download_file(request: Request, file_id: str, db: AsyncSession = Depen
     object_name = doc.minio_path.split("/")[-1]
 
     try:
-        stat = minio_client.client.stat_object(bucket, object_name)
+        # stat = minio_client.client.stat_object(bucket, object_name)
+        # 使用 run_in_threadpool 避免阻塞事件循环
+        stat = await run_in_threadpool(minio_client.client.stat_object, bucket, object_name)
         total_size = int(stat.size)
     except Exception:
         # Fallback to DB size if stat fails

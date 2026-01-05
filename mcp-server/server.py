@@ -63,15 +63,16 @@ class AIClient:
 
 ai_client = AIClient()
 
-async def download_file_from_backend(file_id: str) -> bytes | None:
+async def download_file_from_backend(file_id: str) -> bytes:
+    url = f"{BACKEND_URL}/files/{file_id}/download"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(f"{BACKEND_URL}/files/{file_id}/download")
+            resp = await client.get(url)
             if resp.status_code == 200:
                 return resp.content
+            raise Exception(f"Status {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        print(f"Failed to download file {file_id}: {e}")
-    return None
+        raise Exception(f"Download error: {str(e)}")
 
 async def upload_generated_document(file_content: bytes, filename: str) -> str:
     """上传生成的文档到后端，失败时抛出异常"""
@@ -104,6 +105,14 @@ def set_chinese_font(run, font_name='微软雅黑', size=12, bold=False, color=N
     run.font.bold = bold
     if color:
         run.font.color.rgb = color
+
+def safe_str(val):
+    """安全转换为字符串"""
+    if val is None:
+        return ""
+    if isinstance(val, (dict, list)):
+        return str(val)
+    return str(val)
 
 def parse_ai_content_for_template(content: str, template_type: str, ai_model: str | None = None) -> dict:
     """使用AI解析内容并提取结构化数据用于填充模板"""
@@ -226,36 +235,38 @@ def create_document_from_content(content: str, template_type: str = 'default', a
         
         if template_type == 'resume':
             title = parsed_data.get('title', '个人简历')
-            doc.add_heading(title, 0)
+            doc.add_heading(safe_str(title), 0)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=18, bold=True)
             
             # 个人信息
             doc.add_heading('个人信息', level=1)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
             personal_info = parsed_data.get('personal_info', {})
-            for key in ['姓名', '电话', '邮箱', '地址']:
-                p = doc.add_paragraph()
-                p.add_run(f'{key}：')
-                set_chinese_font(p.runs[-1], bold=True)
-                value = personal_info.get(key, '') or ''
-                p.add_run(value if value else '[待填写]')
-                set_chinese_font(p.runs[-1])
+            if isinstance(personal_info, dict):
+                for key in ['姓名', '电话', '邮箱', '地址']:
+                    p = doc.add_paragraph()
+                    p.add_run(f'{key}：')
+                    set_chinese_font(p.runs[-1], bold=True)
+                    value = personal_info.get(key, '') or ''
+                    p.add_run(safe_str(value) if value else '[待填写]')
+                    set_chinese_font(p.runs[-1])
             doc.add_paragraph()
             
             # 教育背景
             doc.add_heading('教育背景', level=1)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
             education_list = parsed_data.get('education', [])
-            if education_list:
+            if education_list and isinstance(education_list, list):
                 for edu in education_list:
-                    for key in ['学校', '专业', '学历', '时间']:
-                        p = doc.add_paragraph()
-                        p.add_run(f'{key}：')
-                        set_chinese_font(p.runs[-1], bold=True)
-                        value = edu.get(key, '') or ''
-                        p.add_run(value if value else '[待填写]')
-                        set_chinese_font(p.runs[-1])
-                    doc.add_paragraph()
+                    if isinstance(edu, dict):
+                        for key in ['学校', '专业', '学历', '时间']:
+                            p = doc.add_paragraph()
+                            p.add_run(f'{key}：')
+                            set_chinese_font(p.runs[-1], bold=True)
+                            value = edu.get(key, '') or ''
+                            p.add_run(safe_str(value) if value else '[待填写]')
+                            set_chinese_font(p.runs[-1])
+                        doc.add_paragraph()
             else:
                 p = doc.add_paragraph('[待填写教育背景]')
                 set_chinese_font(p.runs[-1])
@@ -264,16 +275,17 @@ def create_document_from_content(content: str, template_type: str = 'default', a
             doc.add_heading('工作经历', level=1)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
             work_list = parsed_data.get('work_experience', [])
-            if work_list:
+            if work_list and isinstance(work_list, list):
                 for work in work_list:
-                    for key in ['公司', '职位', '时间', '职责']:
-                        p = doc.add_paragraph()
-                        p.add_run(f'{key}：')
-                        set_chinese_font(p.runs[-1], bold=True)
-                        value = work.get(key, '') or ''
-                        p.add_run(value if value else '[待填写]')
-                        set_chinese_font(p.runs[-1])
-                    doc.add_paragraph()
+                    if isinstance(work, dict):
+                        for key in ['公司', '职位', '时间', '职责']:
+                            p = doc.add_paragraph()
+                            p.add_run(f'{key}：')
+                            set_chinese_font(p.runs[-1], bold=True)
+                            value = work.get(key, '') or ''
+                            p.add_run(safe_str(value) if value else '[待填写]')
+                            set_chinese_font(p.runs[-1])
+                        doc.add_paragraph()
             else:
                 p = doc.add_paragraph('[待填写工作经历]')
                 set_chinese_font(p.runs[-1])
@@ -282,8 +294,8 @@ def create_document_from_content(content: str, template_type: str = 'default', a
             doc.add_heading('技能特长', level=1)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
             skills = parsed_data.get('skills', [])
-            if skills:
-                p = doc.add_paragraph('• ' + '\n• '.join(skills))
+            if skills and isinstance(skills, list):
+                p = doc.add_paragraph('• ' + '\n• '.join([safe_str(s) for s in skills]))
                 set_chinese_font(p.runs[-1])
             else:
                 p = doc.add_paragraph('[待填写技能]')
@@ -294,27 +306,28 @@ def create_document_from_content(content: str, template_type: str = 'default', a
             doc.add_heading('自我评价', level=1)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
             self_eval = parsed_data.get('self_evaluation', '')
-            p = doc.add_paragraph(self_eval if self_eval else '[待填写自我评价]')
+            p = doc.add_paragraph(safe_str(self_eval) if self_eval else '[待填写自我评价]')
             set_chinese_font(p.runs[-1])
         
         elif template_type == 'report':
             title = parsed_data.get('title', '项目报告')
-            doc.add_heading(title, 0)
+            doc.add_heading(safe_str(title), 0)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=18, bold=True)
             
             sections = parsed_data.get('sections', {})
             section_order = ['项目概述', '项目目标', '实施过程', '主要成果', '存在问题', '改进建议', '总结']
             
-            for section_name in section_order:
-                doc.add_heading(section_name, level=1)
-                set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
-                section_content = sections.get(section_name, '')
-                p = doc.add_paragraph(section_content if section_content else '[待填写内容]')
-                set_chinese_font(p.runs[-1])
+            if isinstance(sections, dict):
+                for section_name in section_order:
+                    doc.add_heading(section_name, level=1)
+                    set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
+                    section_content = sections.get(section_name, '')
+                    p = doc.add_paragraph(safe_str(section_content) if section_content else '[待填写内容]')
+                    set_chinese_font(p.runs[-1])
         
         elif template_type == 'meeting':
             title = parsed_data.get('title', '会议纪要')
-            doc.add_heading(title, 0)
+            doc.add_heading(safe_str(title), 0)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=18, bold=True)
             
             # 基本信息
@@ -323,7 +336,7 @@ def create_document_from_content(content: str, template_type: str = 'default', a
                 p.add_run(f'{key}：')
                 set_chinese_font(p.runs[-1], bold=True)
                 value = parsed_data.get(field, '')
-                p.add_run(value if value else '[待填写]')
+                p.add_run(safe_str(value) if value else '[待填写]')
                 set_chinese_font(p.runs[-1])
             
             # 各部分内容
@@ -331,38 +344,40 @@ def create_document_from_content(content: str, template_type: str = 'default', a
                 doc.add_heading(section_name, level=1)
                 set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
                 section_content = parsed_data.get(field, '')
-                p = doc.add_paragraph(section_content if section_content else '[待填写]')
+                p = doc.add_paragraph(safe_str(section_content) if section_content else '[待填写]')
                 set_chinese_font(p.runs[-1])
         
         elif template_type == 'contract':
             title = parsed_data.get('title', '合同协议')
-            doc.add_heading(title, 0)
+            doc.add_heading(safe_str(title), 0)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=18, bold=True)
             
             # 甲方信息
             doc.add_heading('甲方信息', level=1)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
             party_a = parsed_data.get('party_a', {})
-            for key in ['名称', '地址', '联系人', '电话']:
-                p = doc.add_paragraph()
-                p.add_run(f'{key}：')
-                set_chinese_font(p.runs[-1], bold=True)
-                value = party_a.get(key, '')
-                p.add_run(value if value else '[待填写]')
-                set_chinese_font(p.runs[-1])
+            if isinstance(party_a, dict):
+                for key in ['名称', '地址', '联系人', '电话']:
+                    p = doc.add_paragraph()
+                    p.add_run(f'{key}：')
+                    set_chinese_font(p.runs[-1], bold=True)
+                    value = party_a.get(key, '')
+                    p.add_run(safe_str(value) if value else '[待填写]')
+                    set_chinese_font(p.runs[-1])
             doc.add_paragraph()
             
             # 乙方信息
             doc.add_heading('乙方信息', level=1)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
             party_b = parsed_data.get('party_b', {})
-            for key in ['名称', '地址', '联系人', '电话']:
-                p = doc.add_paragraph()
-                p.add_run(f'{key}：')
-                set_chinese_font(p.runs[-1], bold=True)
-                value = party_b.get(key, '')
-                p.add_run(value if value else '[待填写]')
-                set_chinese_font(p.runs[-1])
+            if isinstance(party_b, dict):
+                for key in ['名称', '地址', '联系人', '电话']:
+                    p = doc.add_paragraph()
+                    p.add_run(f'{key}：')
+                    set_chinese_font(p.runs[-1], bold=True)
+                    value = party_b.get(key, '')
+                    p.add_run(safe_str(value) if value else '[待填写]')
+                    set_chinese_font(p.runs[-1])
             doc.add_paragraph()
             
             # 其他部分
@@ -370,42 +385,44 @@ def create_document_from_content(content: str, template_type: str = 'default', a
                 doc.add_heading(section_name, level=1)
                 set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
                 section_content = parsed_data.get(field, '')
-                p = doc.add_paragraph(section_content if section_content else '[待填写]')
+                p = doc.add_paragraph(safe_str(section_content) if section_content else '[待填写]')
                 set_chinese_font(p.runs[-1])
             
             # 合同期限
             doc.add_heading('合同期限', level=1)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
             period = parsed_data.get('period', {})
-            for key in ['开始时间', '结束时间']:
-                p = doc.add_paragraph()
-                p.add_run(f'{key}：')
-                set_chinese_font(p.runs[-1], bold=True)
-                value = period.get(key, '')
-                p.add_run(value if value else '[待填写]')
-                set_chinese_font(p.runs[-1])
+            if isinstance(period, dict):
+                for key in ['开始时间', '结束时间']:
+                    p = doc.add_paragraph()
+                    p.add_run(f'{key}：')
+                    set_chinese_font(p.runs[-1], bold=True)
+                    value = period.get(key, '')
+                    p.add_run(safe_str(value) if value else '[待填写]')
+                    set_chinese_font(p.runs[-1])
         
         elif template_type == 'proposal':
             title = parsed_data.get('title', '项目提案')
-            doc.add_heading(title, 0)
+            doc.add_heading(safe_str(title), 0)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=18, bold=True)
             
             sections = parsed_data.get('sections', {})
             section_order = ['项目背景', '项目目标', '项目内容', '实施方案', '时间计划', '预算说明', '预期成果', '风险评估']
             
-            for section_name in section_order:
-                doc.add_heading(section_name, level=1)
-                set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
-                section_content = sections.get(section_name, '')
-                p = doc.add_paragraph(section_content if section_content else '[待填写内容]')
-                set_chinese_font(p.runs[-1])
+            if isinstance(sections, dict):
+                for section_name in section_order:
+                    doc.add_heading(section_name, level=1)
+                    set_chinese_font(doc.paragraphs[-1].runs[0], size=14, bold=True)
+                    section_content = sections.get(section_name, '')
+                    p = doc.add_paragraph(safe_str(section_content) if section_content else '[待填写内容]')
+                    set_chinese_font(p.runs[-1])
         
         else:
             # 如果有raw_content，直接输出
             raw = parsed_data.get('raw_content', content)
             doc.add_heading('文档', 0)
             set_chinese_font(doc.paragraphs[-1].runs[0], size=18, bold=True)
-            p = doc.add_paragraph(raw)
+            p = doc.add_paragraph(safe_str(raw))
             set_chinese_font(p.runs[-1])
     
     elif template_type == 'invoice':
@@ -555,10 +572,10 @@ async def _analyze_document_logic(file_id: str, analysis_type: str, ai_model: st
         return {"raw_analysis": ai_response}
 
 async def _extract_content_logic(file_id: str, format: str):
-    file_content = await download_file_from_backend(file_id)
-    
-    if not file_content:
-        return f"无法提取内容：文档 {file_id} 下载失败"
+    try:
+        file_content = await download_file_from_backend(file_id)
+    except Exception as e:
+        return f"无法提取内容：文档 {file_id} 下载失败 - {str(e)}"
     
     try:
         # 尝试检测文件类型
@@ -657,6 +674,8 @@ async def _generate_document_logic(content: str, template_file_id: str, output_f
         
         return {"result_file_id": file_id, "filename": filename, "template_type": template_type}
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         error_msg = f"Failed to generate/upload document: {str(e)}"
         print(error_msg)
         return {"error": error_msg}

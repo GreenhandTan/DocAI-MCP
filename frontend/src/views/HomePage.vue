@@ -29,6 +29,9 @@ import {
   ThumbsUp,
   ThumbsDown,
   Copy,
+  MoreHorizontal,
+  Pencil,
+  Trash2,
 } from "lucide-vue-next";
 
 const router = useRouter();
@@ -64,6 +67,7 @@ interface ChatMessage {
   attachments?: UploadedFile[];
   isStreaming?: boolean;
   timestamp: Date;
+  taskId?: string; // 关联的任务ID
 }
 
 interface Conversation {
@@ -124,12 +128,7 @@ const selectedFiles = computed(() =>
 );
 
 const canSend = computed(
-  () =>
-    inputMessage.value.trim().length > 0 &&
-    (selectedFileIds.value.length > 0 ||
-      selectedTemplate.value ||
-      customTemplateFile.value) &&
-    !isSending.value
+  () => inputMessage.value.trim().length > 0 && !isSending.value
 );
 
 // ============ 工具函数 ============
@@ -268,6 +267,22 @@ const fetchTasks = async () => {
   try {
     const { data } = await axios.get("/api/v1/tasks");
     tasks.value = data;
+
+    // 更新聊天消息中的任务状态
+    if (currentConversation.value) {
+      currentConversation.value.messages.forEach((msg) => {
+        if (msg.taskId) {
+          const task = tasks.value.find((t) => t.task_id === msg.taskId);
+          if (task) {
+            if (task.status === "completed") {
+              msg.content = "✅ 文档处理任务已完成！";
+            } else if (task.status === "failed") {
+              msg.content = `❌ 文档处理任务失败：${task.error || "未知错误"}`;
+            }
+          }
+        }
+      });
+    }
   } catch (e) {
     console.error("Fetch tasks failed:", e);
   }
@@ -362,6 +377,21 @@ const sendMessage = async () => {
 
   await scrollToBottom();
 
+  // 收集历史消息（排除当前正在发送的用户消息和AI占位消息）
+  const historyMessages =
+    currentConversation.value?.messages.slice(0, -2).map((msg) => ({
+      role: msg.role,
+      content: msg.content,
+    })) || [];
+
+  // 收集所有相关的文件ID（包括历史消息中的附件）
+  const allFileIds = new Set<string>(selectedFileIds.value);
+  currentConversation.value?.messages.forEach((msg) => {
+    if (msg.attachments) {
+      msg.attachments.forEach((f) => allFileIds.add(f.file_id));
+    }
+  });
+
   try {
     // 使用流式API
     const response = await fetch("/api/v1/ai/chat/stream", {
@@ -369,7 +399,8 @@ const sendMessage = async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message: text,
-        file_ids: selectedFileIds.value,
+        history: historyMessages,
+        file_ids: Array.from(allFileIds),
         preset_template: selectedTemplate.value,
         template_file_id: customTemplateFile.value?.file_id,
         model: selectedModel.value,
@@ -380,6 +411,30 @@ const sendMessage = async () => {
     const decoder = new TextDecoder();
     let buffer = ""; // 用于处理跨块的标签
     let isThinkingState = false;
+
+    // 打字机效果队列
+    const contentQueue: string[] = [];
+
+    const processQueue = async () => {
+      while (true) {
+        if (contentQueue.length > 0) {
+          const chunk = contentQueue.shift();
+          if (chunk) {
+            for (const char of chunk) {
+              aiMessage.content += char;
+              await new Promise((r) => setTimeout(r, 10)); // 10ms per char
+            }
+            await scrollToBottom();
+          }
+        } else {
+          if (!aiMessage.isStreaming) break;
+          await new Promise((r) => setTimeout(r, 50));
+        }
+      }
+    };
+
+    // 启动打字机处理循环
+    processQueue();
 
     if (reader) {
       while (true) {
@@ -410,7 +465,7 @@ const sendMessage = async () => {
                     const startTagIndex = buffer.indexOf("<think>");
                     if (startTagIndex !== -1) {
                       // 发现开始标签，将前面的内容追加到正文
-                      aiMessage.content += buffer.substring(0, startTagIndex);
+                      contentQueue.push(buffer.substring(0, startTagIndex));
                       // 切换到思考模式
                       isThinkingState = true;
                       isThinking.value = true;
@@ -420,10 +475,10 @@ const sendMessage = async () => {
                       // 未发现完整标签，检查是否有部分标签在末尾
                       const lastOpen = buffer.lastIndexOf("<");
                       if (lastOpen !== -1 && buffer.length - lastOpen < 7) {
-                        aiMessage.content += buffer.substring(0, lastOpen);
+                        contentQueue.push(buffer.substring(0, lastOpen));
                         buffer = buffer.substring(lastOpen);
                       } else {
-                        aiMessage.content += buffer;
+                        contentQueue.push(buffer);
                         buffer = "";
                       }
                       break; // 等待更多数据
@@ -463,7 +518,7 @@ const sendMessage = async () => {
                     thinkingText.value += buffer;
                     aiMessage.thinking = thinkingText.value;
                   } else {
-                    aiMessage.content += buffer;
+                    contentQueue.push(buffer);
                   }
                 }
                 aiMessage.isStreaming = false;
@@ -487,13 +542,19 @@ const sendMessage = async () => {
     aiMessage.isStreaming = false;
   }
 
-  // 只有 AI 调用成功（有实际内容且无错误）才创建后台任务
+  // 只有 AI 调用成功（有实际内容且无错误）且涉及文件/模板操作时，才创建后台任务
   const aiHasError =
     aiMessage.content.startsWith("抱歉，处理请求时出现错误") ||
     aiMessage.content === "AI 响应失败，请稍后重试。";
-  if (!aiHasError && aiMessage.content.length > 0) {
+
+  const hasFilesOrTemplate =
+    selectedFileIds.value.length > 0 ||
+    selectedTemplate.value ||
+    customTemplateFile.value;
+
+  if (!aiHasError && aiMessage.content.length > 0 && hasFilesOrTemplate) {
     try {
-      await axios.post("/api/v1/tasks/create", {
+      const { data: taskData } = await axios.post("/api/v1/tasks/create", {
         task_type:
           selectedTemplate.value || customTemplateFile.value
             ? "fill_template"
@@ -511,6 +572,7 @@ const sendMessage = async () => {
         role: "assistant",
         content: "✅ 已创建文档处理任务，正在后台处理中...",
         timestamp: new Date(),
+        taskId: taskData.task_id, // 关联任务ID
       };
       currentConversation.value?.messages.push(taskMessage);
 
@@ -578,8 +640,64 @@ const getTaskStatusClass = (status: string) => {
   }
 };
 
+// ============ 会话管理（增强） ============
+const activeMenuId = ref<string | null>(null);
+const editingConversationId = ref<string | null>(null);
+const editTitleInput = ref("");
+
+const toggleMenu = (id: string) => {
+  activeMenuId.value = activeMenuId.value === id ? null : id;
+};
+
+const closeMenu = () => {
+  activeMenuId.value = null;
+};
+
+const startRename = (conv: Conversation) => {
+  editingConversationId.value = conv.id;
+  editTitleInput.value = conv.title;
+  activeMenuId.value = null;
+};
+
+const saveRename = () => {
+  if (editingConversationId.value) {
+    const conv = conversations.value.find(
+      (c) => c.id === editingConversationId.value
+    );
+    if (conv) {
+      conv.title = editTitleInput.value.trim() || "未命名对话";
+    }
+    editingConversationId.value = null;
+  }
+};
+
+const cancelRename = () => {
+  editingConversationId.value = null;
+};
+
+const deleteConversation = (id: string) => {
+  if (confirm("确定要删除这个对话吗？")) {
+    conversations.value = conversations.value.filter((c) => c.id !== id);
+    if (currentConversationId.value === id) {
+      if (conversations.value.length > 0) {
+        currentConversationId.value = conversations.value[0].id;
+      } else {
+        createNewConversation();
+      }
+    }
+    activeMenuId.value = null;
+  }
+};
+
+// 自动聚焦指令
+const vFocus = {
+  mounted: (el: HTMLElement) => el.focus(),
+};
+
 // ============ 生命周期 ============
 onMounted(async () => {
+  document.addEventListener("click", closeMenu);
+
   // 先加载历史会话
   loadConversationsFromStorage();
 
@@ -593,6 +711,8 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  document.removeEventListener("click", closeMenu);
+
   if (taskTimer) {
     window.clearInterval(taskTimer);
   }
@@ -640,27 +760,90 @@ onBeforeUnmount(() => {
           历史会话
         </div>
         <div class="space-y-1">
-          <button
+          <div
             v-for="conv in conversations"
             :key="conv.id"
-            @click="switchConversation(conv.id)"
-            class="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-left text-sm transition-all duration-200 group"
+            class="group relative flex items-center gap-2 px-3 py-2.5 rounded-lg transition-all duration-200"
             :class="
               currentConversationId === conv.id
                 ? 'bg-slate-800 text-white shadow-sm'
                 : 'text-slate-400 hover:bg-slate-800/50 hover:text-slate-200'
             "
           >
-            <MessageSquare
-              class="w-4 h-4 shrink-0 transition-colors"
-              :class="
-                currentConversationId === conv.id
-                  ? 'text-indigo-400'
-                  : 'text-slate-600 group-hover:text-slate-500'
-              "
-            />
-            <span class="truncate font-medium">{{ conv.title }}</span>
-          </button>
+            <!-- 编辑模式 -->
+            <div
+              v-if="editingConversationId === conv.id"
+              class="flex-1 flex items-center gap-2 min-w-0"
+            >
+              <input
+                v-focus
+                v-model="editTitleInput"
+                @blur="saveRename"
+                @keyup.enter="saveRename"
+                @keyup.esc="cancelRename"
+                class="w-full bg-slate-900 text-white text-sm px-2 py-1 rounded border border-indigo-500 focus:outline-none"
+              />
+            </div>
+
+            <!-- 正常模式 -->
+            <button
+              v-else
+              @click="switchConversation(conv.id)"
+              class="flex-1 flex items-center gap-3 min-w-0 text-left outline-none"
+            >
+              <MessageSquare
+                class="w-4 h-4 shrink-0 transition-colors"
+                :class="
+                  currentConversationId === conv.id
+                    ? 'text-indigo-400'
+                    : 'text-slate-600 group-hover:text-slate-500'
+                "
+              />
+              <span class="truncate font-medium" :title="conv.title">
+                {{
+                  conv.title.length > 20
+                    ? conv.title.slice(0, 20) + "..."
+                    : conv.title
+                }}
+              </span>
+            </button>
+
+            <!-- 菜单触发器 -->
+            <div class="relative">
+              <button
+                @click.stop="toggleMenu(conv.id)"
+                class="p-1 rounded-md hover:bg-slate-700 transition-opacity opacity-0 group-hover:opacity-100"
+                :class="{
+                  'opacity-100':
+                    activeMenuId === conv.id ||
+                    currentConversationId === conv.id,
+                }"
+              >
+                <MoreHorizontal class="w-4 h-4" />
+              </button>
+
+              <!-- 下拉菜单 -->
+              <div
+                v-if="activeMenuId === conv.id"
+                class="absolute right-0 top-full mt-1 w-36 bg-white rounded-lg shadow-xl border border-slate-100 z-50 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-100"
+              >
+                <button
+                  @click.stop="startRename(conv)"
+                  class="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 hover:text-indigo-600 text-left"
+                >
+                  <Pencil class="w-3.5 h-3.5" />
+                  <span>编辑标题</span>
+                </button>
+                <button
+                  @click.stop="deleteConversation(conv.id)"
+                  class="w-full flex items-center gap-2 px-3 py-2 text-sm text-rose-600 hover:bg-rose-50 text-left"
+                >
+                  <Trash2 class="w-3.5 h-3.5" />
+                  <span>删除</span>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -907,6 +1090,7 @@ onBeforeUnmount(() => {
 
                 <!-- 正文内容 -->
                 <div
+                  v-if="msg.content || (msg.isStreaming && !isThinking)"
                   class="bg-slate-50 border border-slate-200 rounded-2xl rounded-tl-sm px-5 py-4 shadow-sm"
                 >
                   <div
@@ -974,19 +1158,6 @@ onBeforeUnmount(() => {
         class="shrink-0 bg-gradient-to-t from-white via-white to-transparent pt-10 pb-6 px-6"
       >
         <div class="max-w-3xl mx-auto relative">
-          <!-- 正在思考提示 -->
-          <div
-            v-if="isThinking && isSending"
-            class="absolute -top-10 left-0 right-0 flex justify-center"
-          >
-            <div
-              class="flex items-center gap-2 px-4 py-1.5 bg-white/90 backdrop-blur border border-indigo-100 rounded-full shadow-sm text-sm text-indigo-600"
-            >
-              <Loader2 class="w-3.5 h-3.5 animate-spin" />
-              <span class="font-medium">正在思考中...</span>
-            </div>
-          </div>
-
           <div
             class="bg-white rounded-2xl border border-slate-200 shadow-xl shadow-slate-200/50 focus-within:border-indigo-300 focus-within:ring-4 focus-within:ring-indigo-100 transition-all duration-300"
           >
