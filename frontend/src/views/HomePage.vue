@@ -403,7 +403,7 @@ const sendMessage = async () => {
               } else if (data.type === "content") {
                 // 内容类型，可能包含 <think> 标签
                 buffer += data.content;
-                
+
                 // 状态机处理 buffer
                 while (true) {
                   if (!isThinkingState) {
@@ -420,11 +420,11 @@ const sendMessage = async () => {
                       // 未发现完整标签，检查是否有部分标签在末尾
                       const lastOpen = buffer.lastIndexOf("<");
                       if (lastOpen !== -1 && buffer.length - lastOpen < 7) {
-                         aiMessage.content += buffer.substring(0, lastOpen);
-                         buffer = buffer.substring(lastOpen);
+                        aiMessage.content += buffer.substring(0, lastOpen);
+                        buffer = buffer.substring(lastOpen);
                       } else {
-                         aiMessage.content += buffer;
-                         buffer = "";
+                        aiMessage.content += buffer;
+                        buffer = "";
                       }
                       break; // 等待更多数据
                     }
@@ -437,35 +437,34 @@ const sendMessage = async () => {
                       aiMessage.thinking = thinkingText.value;
                       // 切换回正文模式
                       isThinkingState = false;
-                      isThinking.value = false; 
+                      isThinking.value = false;
                       // 移除已处理部分（包括标签）
                       buffer = buffer.substring(endTagIndex + 8);
                     } else {
                       // 未发现完整结束标签，检查末尾
                       const lastOpen = buffer.lastIndexOf("<");
                       if (lastOpen !== -1 && buffer.length - lastOpen < 8) {
-                         thinkingText.value += buffer.substring(0, lastOpen);
-                         aiMessage.thinking = thinkingText.value;
-                         buffer = buffer.substring(lastOpen);
+                        thinkingText.value += buffer.substring(0, lastOpen);
+                        aiMessage.thinking = thinkingText.value;
+                        buffer = buffer.substring(lastOpen);
                       } else {
-                         thinkingText.value += buffer;
-                         aiMessage.thinking = thinkingText.value;
-                         buffer = "";
+                        thinkingText.value += buffer;
+                        aiMessage.thinking = thinkingText.value;
+                        buffer = "";
                       }
                       break;
                     }
                   }
                 }
-                
               } else if (data.type === "done") {
                 // 流结束，处理剩余 buffer
                 if (buffer) {
-                   if (isThinkingState) {
-                      thinkingText.value += buffer;
-                      aiMessage.thinking = thinkingText.value;
-                   } else {
-                      aiMessage.content += buffer;
-                   }
+                  if (isThinkingState) {
+                    thinkingText.value += buffer;
+                    aiMessage.thinking = thinkingText.value;
+                  } else {
+                    aiMessage.content += buffer;
+                  }
                 }
                 aiMessage.isStreaming = false;
                 isThinking.value = false;
