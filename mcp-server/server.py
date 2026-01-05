@@ -10,6 +10,7 @@ import os
 import asyncio
 import io
 import re
+import fitz  # PyMuPDF for PDF extraction
 
 mcp = FastMCP("docai-mcp")
 
@@ -195,15 +196,25 @@ def parse_ai_content_for_template(content: str, template_type: str, ai_model: st
     ai_response = ai_client.generate_completion(full_prompt, model=ai_model)
     
     try:
+        # 移除 <think>...</think> 标签
+        import re
+        ai_response = re.sub(r'<think>[\s\S]*?</think>', '', ai_response).strip()
+        
         # 提取JSON
         if "```json" in ai_response:
             ai_response = ai_response.split("```json")[1].split("```")[0].strip()
         elif "```" in ai_response:
             ai_response = ai_response.split("```")[1].split("```")[0].strip()
+        
+        # 尝试找到 JSON 对象
+        json_match = re.search(r'\{[\s\S]*\}', ai_response)
+        if json_match:
+            return json.loads(json_match.group())
         return json.loads(ai_response)
-    except json.JSONDecodeError:
-        print(f"Failed to parse AI response as JSON: {ai_response[:200]}")
-        return {"raw_content": content}
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse AI response as JSON: {ai_response[:500]}, error: {e}")
+        # 如果解析失败，尝试从原始内容创建基本结构
+        return {"raw_content": content, "title": "文档", "sections": {"内容": content[:2000]}}
 
 def create_document_from_content(content: str, template_type: str = 'default', ai_model: str | None = None) -> bytes:
     """根据内容和模板类型创建文档，使用AI解析内容填充模板"""
@@ -550,18 +561,52 @@ async def _extract_content_logic(file_id: str, format: str):
         return f"无法提取内容：文档 {file_id} 下载失败"
     
     try:
-        doc = Document(io.BytesIO(file_content))
+        # 尝试检测文件类型
         content = []
-        for para in doc.paragraphs:
-            if para.text.strip():
-                content.append(para.text.strip())
         
-        if format == "markdown":
-            return "\n\n".join([f"{p}" for p in content])
-        elif format == "plain":
-            return "\n".join(content)
-        else:
-            return "\n\n".join(content)
+        # 先尝试作为 PDF 解析
+        try:
+            pdf_doc = fitz.open(stream=file_content, filetype="pdf")
+            for page in pdf_doc:
+                text = page.get_text()
+                if text.strip():
+                    content.append(text.strip())
+            pdf_doc.close()
+            if content:
+                if format == "markdown":
+                    return "\n\n".join(content)
+                elif format == "plain":
+                    return "\n".join(content)
+                else:
+                    return "\n\n".join(content)
+        except Exception:
+            pass  # 不是 PDF，尝试其他格式
+        
+        # 尝试作为 DOCX 解析
+        try:
+            doc = Document(io.BytesIO(file_content))
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    content.append(para.text.strip())
+            if content:
+                if format == "markdown":
+                    return "\n\n".join([f"{p}" for p in content])
+                elif format == "plain":
+                    return "\n".join(content)
+                else:
+                    return "\n\n".join(content)
+        except Exception:
+            pass  # 不是 DOCX
+        
+        # 尝试作为纯文本解析
+        try:
+            text = file_content.decode('utf-8')
+            if text.strip():
+                return text.strip()
+        except Exception:
+            pass
+        
+        return f"无法识别文件格式或文件内容为空"
     except Exception as e:
         return f"提取内容失败：{str(e)}"
 

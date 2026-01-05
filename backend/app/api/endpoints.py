@@ -36,6 +36,7 @@ class DocumentResponse(BaseModel):
     status: str
     is_template: bool
     created_at: str | None = None
+    size: int | None = None
 
 class TaskListItem(BaseModel):
     task_id: str
@@ -65,17 +66,20 @@ class ModifyRequest(BaseModel):
 
 
 def _resolve_chat_completions_url() -> str:
+    """解析 AI API URL，支持完整路径或基础路径"""
     url = (settings.AI_API_BASE_URL or "").strip()
     if not url:
         raise HTTPException(status_code=500, detail="AI_API_BASE_URL 未配置")
-    if url.endswith("/chat/completions"):
+    # 如果已经是完整的 chat/completions 路径，直接返回
+    if "/chat/completions" in url:
         return url
+    # 否则追加路径
     return url.rstrip("/") + "/chat/completions"
 
 
 def _resolve_model(requested_model: str | None) -> str:
     model = (requested_model or settings.AI_MODEL_NAME or "").strip()
-    return model or "glm4.7"
+    return model or "minimaxai/minimax-m2.1"
 
 @router.post("/files/upload")
 async def upload_file(
@@ -111,7 +115,8 @@ async def upload_file(
     return {
         "fileId": str(new_doc.id),
         "filename": new_doc.filename,
-        "status": new_doc.status
+        "status": new_doc.status,
+        "size": new_doc.file_size
     }
 
 @router.post("/files/upload-batch")
@@ -211,7 +216,8 @@ async def list_files(db: AsyncSession = Depends(get_db)):
             filename=d.filename,
             status=d.status,
             is_template=bool(d.is_template),
-            created_at=d.created_at.isoformat() if d.created_at else None
+            created_at=d.created_at.isoformat() if d.created_at else None,
+            size=d.file_size
         )
         for d in docs
     ]
@@ -270,7 +276,7 @@ async def ai_chat(payload: ChatRequest):
     return ChatResponse(reply=reply)
 
 @router.post("/ai/chat/stream")
-async def ai_chat_stream(payload: ChatRequest):
+async def ai_chat_stream(payload: ChatRequest, db: AsyncSession = Depends(get_db)):
     """流式聊天接口，支持SSE"""
     if not settings.AI_API_KEY:
         raise HTTPException(status_code=500, detail="AI_API_KEY 未配置")
@@ -282,16 +288,43 @@ async def ai_chat_stream(payload: ChatRequest):
     if not user_text:
         raise HTTPException(status_code=400, detail="message 不能为空")
 
-    prompt = user_text
+    # 提取文件内容
+    file_contents = []
     if payload.file_ids:
+        for file_id in payload.file_ids:
+            try:
+                # 调用 MCP 服务提取内容
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        "http://mcp-server:3000/api/tools/content_extractor/invoke",
+                        json={"file_id": file_id, "format": "markdown"}
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        content = data.get("content", "")
+                        if content and not content.startswith("无法") and not content.startswith("提取"):
+                            file_contents.append(f"【文档内容】:\n{content[:3000]}")  # 限制长度
+            except Exception as e:
+                file_contents.append(f"【文档 {file_id}】: 内容提取失败 - {str(e)}")
+
+    # 构建提示词
+    prompt = user_text
+    if file_contents:
+        docs_text = "\n\n".join(file_contents)
+        template_text = payload.preset_template or "无"
+        prompt = f"以下是用户上传的文档内容：\n\n{docs_text}\n\n用户选择的模板类型：{template_text}\n\n用户需求：{user_text}\n\n请根据文档内容和用户需求，用中文给出详细的处理方案和结果预期。"
+    elif payload.file_ids:
+        # 文件 ID 存在但内容提取失败
         file_ids_text = ", ".join(payload.file_ids)
-        template_text = payload.template_file_id or payload.preset_template or "无"
-        prompt = f"内容文档ID：{file_ids_text}\n模板文档ID：{template_text}\n用户需求：{user_text}\n请用中文给出可执行的处理方案与结果预期。"
+        template_text = payload.preset_template or "无"
+        prompt = f"用户上传了文档（ID: {file_ids_text}），但内容提取失败。\n模板类型：{template_text}\n用户需求：{user_text}\n\n请提示用户重新上传文档或检查文档格式。"
 
     async def generate():
         yield f"data: {json.dumps({'type': 'thinking', 'content': '正在思考...'}, ensure_ascii=False)}\n\n"
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            # 设置合理的超时：连接10秒，读取120秒（AI模型可能需要较长时间响应）
+            timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 async with client.stream(
                     "POST",
                     url,
@@ -330,9 +363,14 @@ async def ai_chat_stream(payload: ChatRequest):
                                 yield f"data: {json.dumps({'type': 'thinking', 'content': reasoning}, ensure_ascii=False)}\n\n"
                             content = delta.get("content")
                             if content:
+                                # 直接发送原始内容，由前端解析 <think> 标签
                                 yield f"data: {json.dumps({'type': 'content', 'content': content}, ensure_ascii=False)}\n\n"
 
                     yield f"data: {json.dumps({'type': 'done', 'content': ''}, ensure_ascii=False)}\n\n"
+        except httpx.TimeoutException as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': f'AI 服务响应超时，请稍后重试: {str(e)}'}, ensure_ascii=False)}\n\n"
+        except httpx.ConnectError as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': f'无法连接到 AI 服务: {str(e)}'}, ensure_ascii=False)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
 

@@ -55,8 +55,6 @@ services:
       - .env.local
     environment:
       JWT_ENABLED: "true"
-      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET}
-      JWT_HEADER: ${ONLYOFFICE_JWT_HEADER}
     ports:
       - "8081:80"
     volumes:
@@ -73,19 +71,7 @@ services:
     env_file:
       - .env
       - .env.local
-    environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_SERVER}:${POSTGRES_PORT}/${POSTGRES_DB}
-      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      MINIO_BUCKET_UPLOADS: ${MINIO_BUCKET_UPLOADS}
-      MINIO_BUCKET_OUTPUTS: ${MINIO_BUCKET_OUTPUTS}
-      ONLYOFFICE_API_URL: ${ONLYOFFICE_API_URL}
-      ONLYOFFICE_PUBLIC_URL: ${ONLYOFFICE_PUBLIC_URL}
-      JWT_SECRET: ${ONLYOFFICE_JWT_SECRET}
-      AI_API_KEY: ${AI_API_KEY}
-      AI_API_BASE_URL: ${AI_API_BASE_URL}
-      AI_MODEL_NAME: ${AI_MODEL_NAME}
+    environment: {}
     ports:
       - "8000:8000"
     depends_on:
@@ -109,9 +95,6 @@ services:
       - .env.local
     environment:
       BACKEND_URL: http://backend:8000/api/v1
-      AI_API_KEY: ${AI_API_KEY}
-      AI_API_BASE_URL: ${AI_API_BASE_URL}
-      AI_MODEL_NAME: ${AI_MODEL_NAME}
     depends_on:
       backend:
         condition: service_healthy

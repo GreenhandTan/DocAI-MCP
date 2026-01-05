@@ -1,7 +1,15 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount, nextTick } from "vue";
+import {
+  ref,
+  computed,
+  onMounted,
+  onBeforeUnmount,
+  nextTick,
+  watch,
+} from "vue";
 import { useRouter } from "vue-router";
 import axios from "axios";
+import { marked } from "marked";
 import {
   Plus,
   MessageSquare,
@@ -14,6 +22,7 @@ import {
   AlertCircle,
   Clock,
   ChevronRight,
+  ChevronDown,
   Paperclip,
   Sparkles,
   RotateCcw,
@@ -78,12 +87,14 @@ const isThinking = ref(false);
 const thinkingText = ref("");
 const messagesContainer = ref<HTMLElement | null>(null);
 
-// 模型选择
+// 模型选择 (使用 NVIDIA API 完整模型路径)
 const modelOptions = [
-  { id: "glm4.7", name: "glm4.7" },
-  { id: "minimax-m2.1", name: "minimax-m2.1" },
+  { id: "minimaxai/minimax-m2.1", name: "MiniMax-M2.1" },
+  { id: "deepseek-ai/deepseek-r1", name: "DeepSeek-R1" },
+  { id: "qwen/qwq-32b", name: "Qwen-QWQ-32B" },
+  { id: "z-ai/glm4.7", name: "GLM-4.7" },
 ];
-const selectedModel = ref<string>("glm4.7");
+const selectedModel = ref<string>("minimaxai/minimax-m2.1");
 
 // 模板相关
 const presetTemplates = [
@@ -123,6 +134,61 @@ const canSend = computed(
 
 // ============ 工具函数 ============
 const generateId = () => Math.random().toString(36).substring(2, 15);
+
+// 配置 marked 选项
+marked.setOptions({
+  breaks: true, // 支持换行
+  gfm: true, // 支持 GitHub 风格 Markdown
+});
+
+// Markdown 渲染函数
+const renderMarkdown = (content: string): string => {
+  if (!content) return "";
+  try {
+    return marked.parse(content) as string;
+  } catch {
+    return content;
+  }
+};
+
+// localStorage 持久化
+const STORAGE_KEY = "docai_conversations";
+
+const saveConversationsToStorage = () => {
+  try {
+    const data = JSON.stringify(conversations.value);
+    localStorage.setItem(STORAGE_KEY, data);
+  } catch (e) {
+    console.error("Failed to save conversations:", e);
+  }
+};
+
+const loadConversationsFromStorage = () => {
+  try {
+    const data = localStorage.getItem(STORAGE_KEY);
+    if (data) {
+      const parsed = JSON.parse(data);
+      // 还原 Date 对象
+      conversations.value = parsed.map((conv: any) => ({
+        ...conv,
+        createdAt: new Date(conv.createdAt),
+        messages: conv.messages.map((msg: any) => ({
+          ...msg,
+          timestamp: new Date(msg.timestamp),
+        })),
+      }));
+      // 选中最新的会话
+      if (conversations.value.length > 0) {
+        currentConversationId.value = conversations.value[0].id;
+      }
+    }
+  } catch (e) {
+    console.error("Failed to load conversations:", e);
+  }
+};
+
+// 监听会话变化并保存
+watch(conversations, saveConversationsToStorage, { deep: true });
 
 const scrollToBottom = async () => {
   await nextTick();
@@ -168,6 +234,13 @@ const handleFileSelect = async (event: Event) => {
       await fetchFiles();
       if (data.fileId) {
         selectedFileIds.value.push(data.fileId);
+        // 更新文件大小到本地状态
+        const uploaded = uploadedFiles.value.find(
+          (f) => f.file_id === data.fileId
+        );
+        if (uploaded && data.size) {
+          uploaded.size = data.size;
+        }
       }
     } catch (e) {
       console.error("Upload failed:", e);
@@ -305,13 +378,15 @@ const sendMessage = async () => {
 
     const reader = response.body?.getReader();
     const decoder = new TextDecoder();
+    let buffer = ""; // 用于处理跨块的标签
+    let isThinkingState = false;
 
     if (reader) {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const chunk = decoder.decode(value);
+        const chunk = decoder.decode(value, { stream: true });
         const lines = chunk.split("\n");
 
         for (const line of lines) {
@@ -320,22 +395,88 @@ const sendMessage = async () => {
               const data = JSON.parse(line.slice(6));
 
               if (data.type === "thinking") {
+                // 后端明确返回的 thinking 类型 (如 reasoning_content)
                 isThinking.value = true;
+                isThinkingState = true;
                 thinkingText.value += data.content;
                 aiMessage.thinking = thinkingText.value;
               } else if (data.type === "content") {
-                isThinking.value = false;
-                aiMessage.content += data.content;
+                // 内容类型，可能包含 <think> 标签
+                buffer += data.content;
+                
+                // 状态机处理 buffer
+                while (true) {
+                  if (!isThinkingState) {
+                    const startTagIndex = buffer.indexOf("<think>");
+                    if (startTagIndex !== -1) {
+                      // 发现开始标签，将前面的内容追加到正文
+                      aiMessage.content += buffer.substring(0, startTagIndex);
+                      // 切换到思考模式
+                      isThinkingState = true;
+                      isThinking.value = true;
+                      // 移除已处理部分（包括标签）
+                      buffer = buffer.substring(startTagIndex + 7);
+                    } else {
+                      // 未发现完整标签，检查是否有部分标签在末尾
+                      const lastOpen = buffer.lastIndexOf("<");
+                      if (lastOpen !== -1 && buffer.length - lastOpen < 7) {
+                         aiMessage.content += buffer.substring(0, lastOpen);
+                         buffer = buffer.substring(lastOpen);
+                      } else {
+                         aiMessage.content += buffer;
+                         buffer = "";
+                      }
+                      break; // 等待更多数据
+                    }
+                  } else {
+                    // 思考模式中
+                    const endTagIndex = buffer.indexOf("</think>");
+                    if (endTagIndex !== -1) {
+                      // 发现结束标签，将前面的内容追加到思考
+                      thinkingText.value += buffer.substring(0, endTagIndex);
+                      aiMessage.thinking = thinkingText.value;
+                      // 切换回正文模式
+                      isThinkingState = false;
+                      isThinking.value = false; 
+                      // 移除已处理部分（包括标签）
+                      buffer = buffer.substring(endTagIndex + 8);
+                    } else {
+                      // 未发现完整结束标签，检查末尾
+                      const lastOpen = buffer.lastIndexOf("<");
+                      if (lastOpen !== -1 && buffer.length - lastOpen < 8) {
+                         thinkingText.value += buffer.substring(0, lastOpen);
+                         aiMessage.thinking = thinkingText.value;
+                         buffer = buffer.substring(lastOpen);
+                      } else {
+                         thinkingText.value += buffer;
+                         aiMessage.thinking = thinkingText.value;
+                         buffer = "";
+                      }
+                      break;
+                    }
+                  }
+                }
+                
               } else if (data.type === "done") {
+                // 流结束，处理剩余 buffer
+                if (buffer) {
+                   if (isThinkingState) {
+                      thinkingText.value += buffer;
+                      aiMessage.thinking = thinkingText.value;
+                   } else {
+                      aiMessage.content += buffer;
+                   }
+                }
                 aiMessage.isStreaming = false;
+                isThinking.value = false;
               } else if (data.type === "error") {
-                aiMessage.content = "抱歉，处理请求时出现错误：" + data.content;
+                aiMessage.content += "\n[错误: " + data.content + "]";
                 aiMessage.isStreaming = false;
               }
 
               await scrollToBottom();
-            } catch {
-              // 忽略解析错误
+            } catch (e) {
+              // console.error("Parse error", e);
             }
           }
         }
@@ -347,36 +488,47 @@ const sendMessage = async () => {
     aiMessage.isStreaming = false;
   }
 
-  // 创建后台任务
-  try {
-    await axios.post("/api/v1/tasks/create", {
-      task_type:
-        selectedTemplate.value || customTemplateFile.value
-          ? "fill_template"
-          : "format_document",
-      content_file_ids: selectedFileIds.value,
-      preset_template: selectedTemplate.value,
-      template_file_id: customTemplateFile.value?.file_id,
-      requirements: text,
-      ai_model: selectedModel.value,
-    });
+  // 只有 AI 调用成功（有实际内容且无错误）才创建后台任务
+  const aiHasError =
+    aiMessage.content.startsWith("抱歉，处理请求时出现错误") ||
+    aiMessage.content === "AI 响应失败，请稍后重试。";
+  if (!aiHasError && aiMessage.content.length > 0) {
+    try {
+      await axios.post("/api/v1/tasks/create", {
+        task_type:
+          selectedTemplate.value || customTemplateFile.value
+            ? "fill_template"
+            : "format_document",
+        content_file_ids: selectedFileIds.value,
+        preset_template: selectedTemplate.value,
+        template_file_id: customTemplateFile.value?.file_id,
+        requirements: text,
+        ai_model: selectedModel.value,
+      });
 
-    // 添加任务创建成功的提示
-    const taskMessage: ChatMessage = {
-      id: generateId(),
-      role: "assistant",
-      content: "✅ 已创建文档处理任务，正在后台处理中...",
-      timestamp: new Date(),
-    };
-    currentConversation.value?.messages.push(taskMessage);
+      // 添加任务创建成功的提示
+      const taskMessage: ChatMessage = {
+        id: generateId(),
+        role: "assistant",
+        content: "✅ 已创建文档处理任务，正在后台处理中...",
+        timestamp: new Date(),
+      };
+      currentConversation.value?.messages.push(taskMessage);
 
-    await fetchTasks();
-  } catch (e) {
-    console.error(e);
+      await fetchTasks();
+    } catch (e) {
+      console.error(e);
+    }
   }
 
   isSending.value = false;
   thinkingText.value = "";
+
+  // 清空已选文件和模板
+  selectedFileIds.value = [];
+  selectedTemplate.value = null;
+  customTemplateFile.value = null;
+
   await scrollToBottom();
 };
 
@@ -429,10 +581,13 @@ const getTaskStatusClass = (status: string) => {
 
 // ============ 生命周期 ============
 onMounted(async () => {
+  // 先加载历史会话
+  loadConversationsFromStorage();
+
   await Promise.all([fetchFiles(), fetchTasks()]);
   taskTimer = window.setInterval(fetchTasks, 3000);
 
-  // 创建默认会话
+  // 如果没有会话，创建默认会话
   if (conversations.value.length === 0) {
     createNewConversation();
   }
@@ -593,13 +748,21 @@ onBeforeUnmount(() => {
           </div>
         </div>
         <div class="flex items-center gap-3">
-          <div
-            class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-100 border border-slate-200"
-          >
+          <div class="relative flex items-center">
             <div
-              class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"
+              class="absolute left-3 w-2 h-2 rounded-full bg-emerald-500 animate-pulse pointer-events-none"
             ></div>
-            <span class="text-xs font-medium text-slate-600">K2 模型在线</span>
+            <select
+              v-model="selectedModel"
+              class="pl-7 pr-8 py-1.5 rounded-full border border-slate-200 bg-slate-100 text-slate-600 text-xs font-medium hover:bg-slate-200 transition-colors appearance-none cursor-pointer focus:outline-none focus:border-indigo-300"
+            >
+              <option v-for="m in modelOptions" :key="m.id" :value="m.id">
+                {{ m.name }}
+              </option>
+            </select>
+            <ChevronDown
+              class="absolute right-2.5 w-3 h-3 text-slate-400 pointer-events-none"
+            />
           </div>
         </div>
       </header>
@@ -745,23 +908,30 @@ onBeforeUnmount(() => {
 
                 <!-- 正文内容 -->
                 <div
-                  class="prose prose-slate max-w-none text-slate-800 leading-relaxed"
+                  class="bg-slate-50 border border-slate-200 rounded-2xl rounded-tl-sm px-5 py-4 shadow-sm"
                 >
-                  <template v-if="msg.content">{{ msg.content }}</template>
-                  <span
-                    v-else-if="msg.isStreaming && !isThinking"
-                    class="inline-flex items-center gap-2 text-slate-400"
+                  <div
+                    class="prose prose-slate max-w-none text-slate-800 leading-relaxed prose-headings:text-slate-900 prose-p:my-2 prose-pre:bg-slate-900 prose-pre:text-slate-100 prose-code:text-indigo-600 prose-code:bg-indigo-50 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:before:content-none prose-code:after:content-none"
                   >
+                    <div
+                      v-if="msg.content"
+                      v-html="renderMarkdown(msg.content)"
+                    ></div>
                     <span
-                      class="w-2 h-2 bg-slate-400 rounded-full animate-bounce"
-                    ></span>
-                    <span
-                      class="w-2 h-2 bg-slate-400 rounded-full animate-bounce delay-75"
-                    ></span>
-                    <span
-                      class="w-2 h-2 bg-slate-400 rounded-full animate-bounce delay-150"
-                    ></span>
-                  </span>
+                      v-else-if="msg.isStreaming && !isThinking"
+                      class="inline-flex items-center gap-2 text-slate-400"
+                    >
+                      <span
+                        class="w-2 h-2 bg-slate-400 rounded-full animate-bounce"
+                      ></span>
+                      <span
+                        class="w-2 h-2 bg-slate-400 rounded-full animate-bounce delay-75"
+                      ></span>
+                      <span
+                        class="w-2 h-2 bg-slate-400 rounded-full animate-bounce delay-150"
+                      ></span>
+                    </span>
+                  </div>
                 </div>
 
                 <!-- 消息操作栏 -->
@@ -998,16 +1168,6 @@ onBeforeUnmount(() => {
               </div>
 
               <div class="flex items-center gap-2">
-                <select
-                  v-model="selectedModel"
-                  class="h-10 px-3 rounded-xl border border-slate-200 bg-white text-slate-700 text-sm font-medium hover:bg-slate-50 transition-colors"
-                  title="选择模型"
-                >
-                  <option v-for="m in modelOptions" :key="m.id" :value="m.id">
-                    {{ m.name }}
-                  </option>
-                </select>
-
                 <!-- 发送按钮 -->
                 <button
                   @click="sendMessage"
