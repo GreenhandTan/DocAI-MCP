@@ -52,6 +52,7 @@ async def get_onlyoffice_config(
         "editorConfig": {
             "callbackUrl": callback_url,
             "mode": "edit",
+            "lang": settings.ONLYOFFICE_LANG,
             "user": {
                 "id": "test-user-1", # Mock user
                 "name": "Test User"

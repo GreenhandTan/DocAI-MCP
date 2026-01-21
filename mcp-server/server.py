@@ -431,13 +431,83 @@ def set_chinese_font(run, font_name='微软雅黑', size=12, bold=False, color=N
     if color:
         run.font.color.rgb = color
 
-def safe_str(val):
-    """安全转换为字符串"""
+def _format_structured_text(val) -> str:
     if val is None:
         return ""
-    if isinstance(val, (dict, list)):
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, (int, float, bool)):
         return str(val)
-    return str(val)
+    if isinstance(val, dict):
+        parts: list[str] = []
+        for k, v in val.items():
+            sv = _format_structured_text(v)
+            if sv.strip():
+                parts.append(f"{k}：{sv}")
+        if parts:
+            return "\n".join(parts).strip()
+        try:
+            return json.dumps(val, ensure_ascii=False)
+        except Exception:
+            return str(val)
+    if isinstance(val, list):
+        if not val:
+            return ""
+        if all(isinstance(x, dict) for x in val):
+            lines: list[str] = []
+            for item in val:
+                if not isinstance(item, dict):
+                    continue
+                mapped = {str(k): _format_structured_text(v) for k, v in item.items()}
+                key_map = {
+                    "item": "事项",
+                    "deadline": "截止",
+                    "owner": "负责人",
+                    "assignee": "负责人",
+                    "date": "日期",
+                    "time": "时间",
+                }
+                if "item" in mapped or "事项" in mapped:
+                    text = (mapped.get("事项") or mapped.get("item") or "").strip()
+                    owner = (mapped.get("负责人") or mapped.get("owner") or mapped.get("assignee") or "").strip()
+                    deadline = (mapped.get("截止") or mapped.get("deadline") or "").strip()
+                    extra: list[str] = []
+                    if owner:
+                        extra.append(f"负责人：{owner}")
+                    if deadline:
+                        extra.append(f"截止：{deadline}")
+                    line = text
+                    if extra:
+                        line = (line + "（" + "；".join(extra) + "）").strip()
+                    if line:
+                        lines.append(f"• {line}")
+                else:
+                    kv: list[str] = []
+                    for k, v in mapped.items():
+                        kk = key_map.get(k, k)
+                        vv = (v or "").strip()
+                        if vv:
+                            kv.append(f"{kk}：{vv}")
+                    if kv:
+                        lines.append("• " + "；".join(kv))
+            return "\n".join(lines).strip()
+        if all(isinstance(x, str) for x in val):
+            items = [f"• {x.strip()}" for x in val if isinstance(x, str) and x.strip()]
+            return "\n".join(items).strip()
+        items2 = []
+        for x in val:
+            sx = _format_structured_text(x)
+            if sx.strip():
+                items2.append(f"• {sx.strip()}")
+        return "\n".join(items2).strip()
+    try:
+        return json.dumps(val, ensure_ascii=False)
+    except Exception:
+        return str(val)
+
+def safe_str(val):
+    """安全转换为字符串"""
+    return _format_structured_text(val)
 
 def parse_ai_content_for_template(content: str, template_type: str, ai_model: str | None = None) -> dict:
     """使用AI解析内容并提取结构化数据用于填充模板"""

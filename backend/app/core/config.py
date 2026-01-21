@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     # OnlyOffice
     ONLYOFFICE_API_URL: str # Internal URL for backend callbacks
     ONLYOFFICE_PUBLIC_URL: str | None = None # Public URL for frontend JS
+    ONLYOFFICE_LANG: str = "zh-CN"
     JWT_SECRET: str
     
     # AI Config
