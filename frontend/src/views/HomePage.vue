@@ -60,7 +60,7 @@ interface Task {
 
 interface ChatMessage {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   content: string;
   thinking?: string;
   isThinkingExpanded?: boolean;
@@ -90,6 +90,15 @@ const isSending = ref(false);
 const isThinking = ref(false);
 const thinkingText = ref("");
 const messagesContainer = ref<HTMLElement | null>(null);
+const autoScrollEnabled = ref(true);
+const isComposing = ref(false);
+
+const updateAutoScrollState = () => {
+  const el = messagesContainer.value;
+  if (!el) return;
+  const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+  autoScrollEnabled.value = distanceToBottom < 120;
+};
 
 // 模型选择 (使用 NVIDIA API 完整模型路径)
 const modelOptions = [
@@ -189,11 +198,30 @@ const loadConversationsFromStorage = () => {
 // 监听会话变化并保存
 watch(conversations, saveConversationsToStorage, { deep: true });
 
-const scrollToBottom = async () => {
+const scrollToBottom = async (
+  behavior: ScrollBehavior = "smooth",
+  force: boolean = false
+) => {
   await nextTick();
   if (messagesContainer.value) {
-    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
+    if (!force && !autoScrollEnabled.value) return;
+    messagesContainer.value.scrollTo({
+      top: messagesContainer.value.scrollHeight,
+      behavior,
+    });
   }
+};
+
+const forceScrollToBottom = async () => {
+  autoScrollEnabled.value = true;
+  await scrollToBottom("smooth", true);
+};
+
+const handleEnterToSend = (e: KeyboardEvent) => {
+  if (e.isComposing || isComposing.value) return;
+  if (e.shiftKey) return;
+  e.preventDefault();
+  sendMessage();
 };
 
 // ============ 会话管理 ============
@@ -275,9 +303,9 @@ const fetchTasks = async () => {
           const task = tasks.value.find((t) => t.task_id === msg.taskId);
           if (task) {
             if (task.status === "completed") {
-              msg.content = "✅ 文档处理任务已完成！";
+              msg.content = "文档处理任务已完成";
             } else if (task.status === "failed") {
-              msg.content = `❌ 文档处理任务失败：${task.error || "未知错误"}`;
+              msg.content = `文档处理任务失败：${task.error || "未知错误"}`;
             }
           }
         }
@@ -369,20 +397,23 @@ const sendMessage = async () => {
     role: "assistant",
     content: "",
     thinking: "",
-    isThinkingExpanded: true,
+    isThinkingExpanded: false,
     isStreaming: true,
     timestamp: new Date(),
   };
   currentConversation.value?.messages.push(aiMessage);
 
-  await scrollToBottom();
+  await scrollToBottom("auto", true);
 
   // 收集历史消息（排除当前正在发送的用户消息和AI占位消息）
   const historyMessages =
-    currentConversation.value?.messages.slice(0, -2).map((msg) => ({
-      role: msg.role,
-      content: msg.content,
-    })) || [];
+    currentConversation.value?.messages
+      .slice(0, -2)
+      .filter((msg) => msg.role !== "system" && !msg.taskId)
+      .map((msg) => ({
+        role: msg.role,
+        content: msg.content,
+      })) || [];
 
   // 收集所有相关的文件ID（包括历史消息中的附件）
   const allFileIds = new Set<string>(selectedFileIds.value);
@@ -414,6 +445,7 @@ const sendMessage = async () => {
 
     // 打字机效果队列
     const contentQueue: string[] = [];
+    const typingIntervalMs = 16;
 
     const processQueue = async () => {
       while (true) {
@@ -422,9 +454,9 @@ const sendMessage = async () => {
           if (chunk) {
             for (const char of chunk) {
               aiMessage.content += char;
-              await new Promise((r) => setTimeout(r, 10)); // 10ms per char
+              await new Promise<void>((r) => setTimeout(() => r(), typingIntervalMs));
             }
-            await scrollToBottom();
+            await scrollToBottom("auto");
           }
         } else {
           if (!aiMessage.isStreaming) break;
@@ -528,7 +560,7 @@ const sendMessage = async () => {
                 aiMessage.isStreaming = false;
               }
 
-              await scrollToBottom();
+              await scrollToBottom("auto");
             } catch (e) {
               // console.error("Parse error", e);
             }
@@ -569,8 +601,8 @@ const sendMessage = async () => {
       // 添加任务创建成功的提示
       const taskMessage: ChatMessage = {
         id: generateId(),
-        role: "assistant",
-        content: "✅ 已创建文档处理任务，正在后台处理中...",
+        role: "system",
+        content: "已创建文档处理任务，正在后台处理中…",
         timestamp: new Date(),
         taskId: taskData.task_id, // 关联任务ID
       };
@@ -590,7 +622,7 @@ const sendMessage = async () => {
   selectedTemplate.value = null;
   customTemplateFile.value = null;
 
-  await scrollToBottom();
+  await scrollToBottom("auto");
 };
 
 // ============ 其他操作 ============
@@ -950,7 +982,11 @@ onBeforeUnmount(() => {
       </header>
 
       <!-- 消息区域 -->
-      <div ref="messagesContainer" class="flex-1 overflow-y-auto scroll-smooth">
+      <div
+        ref="messagesContainer"
+        class="flex-1 overflow-y-auto"
+        @scroll.passive="updateAutoScrollState"
+      >
         <!-- 空状态 -->
         <div
           v-if="currentMessages.length === 0"
@@ -1002,8 +1038,17 @@ onBeforeUnmount(() => {
             :key="msg.id"
             class="animate-fade-in"
           >
+            <!-- 系统消息 -->
+            <div v-if="msg.role === 'system'" class="flex justify-center">
+              <div
+                class="px-3 py-1.5 text-xs text-slate-600 bg-slate-100 border border-slate-200 rounded-full"
+              >
+                {{ msg.content }}
+              </div>
+            </div>
+
             <!-- 用户消息 -->
-            <div v-if="msg.role === 'user'" class="flex justify-end">
+            <div v-else-if="msg.role === 'user'" class="flex justify-end">
               <div class="max-w-[85%] flex flex-col items-end">
                 <!-- 附件文件 -->
                 <div
@@ -1056,11 +1101,11 @@ onBeforeUnmount(() => {
                 <!-- 思考过程 -->
                 <div v-if="msg.thinking" class="mb-4">
                   <div
-                    class="inline-block rounded-xl overflow-hidden border border-amber-200 bg-amber-50/50"
+                    class="inline-block rounded-xl overflow-hidden border border-slate-200 bg-slate-50"
                   >
                     <button
                       @click="toggleThinking(msg)"
-                      class="w-full flex items-center gap-2 px-3 py-2 text-sm text-amber-700 hover:bg-amber-100/50 transition-colors"
+                      class="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 transition-colors"
                     >
                       <Loader2
                         v-if="msg.isStreaming && isThinking"
@@ -1068,12 +1113,10 @@ onBeforeUnmount(() => {
                       />
                       <span class="font-medium">{{
                         msg.isStreaming && isThinking
-                          ? "正在深度思考..."
+                          ? "思考中…"
                           : "思考过程"
                       }}</span>
-                      <span class="text-xs text-amber-600/70 ml-auto"
-                        >{{ msg.thinking.length }} 字符</span
-                      >
+                      <span class="text-xs text-slate-500 ml-auto">可展开查看</span>
                       <ChevronRight
                         class="w-4 h-4 transition-transform duration-200"
                         :class="msg.isThinkingExpanded ? 'rotate-90' : ''"
@@ -1081,7 +1124,7 @@ onBeforeUnmount(() => {
                     </button>
                     <div
                       v-show="msg.isThinkingExpanded"
-                      class="px-3 py-2 border-t border-amber-200/50 text-sm text-amber-800/80 whitespace-pre-wrap font-mono bg-amber-50/30"
+                      class="px-3 py-2 border-t border-slate-200 text-sm text-slate-600 whitespace-pre-wrap bg-white"
                     >
                       {{ msg.thinking }}
                     </div>
@@ -1096,10 +1139,18 @@ onBeforeUnmount(() => {
                   <div
                     class="prose prose-slate max-w-none text-slate-800 leading-relaxed prose-headings:text-slate-900 prose-p:my-2 prose-pre:bg-slate-900 prose-pre:text-slate-100 prose-code:text-indigo-600 prose-code:bg-indigo-50 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:before:content-none prose-code:after:content-none"
                   >
-                    <div
-                      v-if="msg.content"
-                      v-html="renderMarkdown(msg.content)"
-                    ></div>
+                    <div v-if="msg.content">
+                      <div
+                        v-if="msg.isStreaming"
+                        class="whitespace-pre-wrap break-words text-slate-800"
+                      >
+                        {{ msg.content
+                        }}<span
+                          class="inline-block w-1.5 h-4 bg-slate-400 align-middle ml-0.5 rounded-sm animate-pulse"
+                        ></span>
+                      </div>
+                      <div v-else v-html="renderMarkdown(msg.content)"></div>
+                    </div>
                     <span
                       v-else-if="msg.isStreaming && !isThinking"
                       class="inline-flex items-center gap-2 text-slate-400"
@@ -1150,6 +1201,18 @@ onBeforeUnmount(() => {
               </div>
             </div>
           </div>
+        </div>
+
+        <div
+          v-if="!autoScrollEnabled && currentMessages.length > 0"
+          class="sticky bottom-6 flex justify-center pointer-events-none"
+        >
+          <button
+            class="pointer-events-auto px-3 py-2 rounded-full bg-white border border-slate-200 shadow-lg text-sm text-slate-700 hover:bg-slate-50 transition-colors"
+            @click="forceScrollToBottom"
+          >
+            回到最新
+          </button>
         </div>
       </div>
 
@@ -1239,7 +1302,9 @@ onBeforeUnmount(() => {
             <div class="p-2">
               <textarea
                 v-model="inputMessage"
-                @keydown.enter.exact.prevent="sendMessage"
+                @compositionstart="isComposing = true"
+                @compositionend="isComposing = false"
+                @keydown.enter="handleEnterToSend"
                 placeholder="输入你的需求，或上传文档..."
                 class="w-full resize-none border-none outline-none focus:outline-none focus:ring-0 bg-transparent text-slate-800 placeholder-slate-400 text-base leading-relaxed px-2 shadow-none appearance-none"
                 rows="1"
