@@ -69,3 +69,6 @@ onlyoffice_data/
 
 # ===== Jupyter (if used) =====
 .ipynb_checkpoints/
+
+# ===== AI Knowledge Base (local only) =====
+.knowledge_base/

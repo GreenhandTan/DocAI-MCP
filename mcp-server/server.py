@@ -1,6 +1,10 @@
 from mcp.server.fastmcp import FastMCP
 from fastapi import FastAPI, HTTPException
 from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
@@ -62,6 +66,327 @@ class AIClient:
             return f"AI Error: {str(e)}"
 
 ai_client = AIClient()
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        val = int((os.getenv(name) or "").strip())
+        return val if val > 0 else default
+    except Exception:
+        return default
+
+def _normalize_text(text: str) -> str:
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text.strip()
+
+def _split_text_into_chunks(text: str, max_chars: int, overlap_chars: int, max_chunks: int) -> list[str]:
+    text = _normalize_text(text)
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    paragraphs = [p for p in re.split(r"\n{2,}", text) if p.strip()]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    def flush():
+        nonlocal current, current_len
+        if not current:
+            return
+        chunk = "\n\n".join(current).strip()
+        if chunk:
+            chunks.append(chunk)
+        current = []
+        current_len = 0
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        if len(para) > max_chars:
+            flush()
+            start = 0
+            while start < len(para) and len(chunks) < max_chunks:
+                end = min(start + max_chars, len(para))
+                chunks.append(para[start:end].strip())
+                if end >= len(para):
+                    break
+                start = max(0, end - overlap_chars)
+            continue
+
+        if current_len + len(para) + (2 if current else 0) > max_chars:
+            flush()
+        current.append(para)
+        current_len += len(para) + (2 if current_len else 0)
+        if len(chunks) >= max_chunks:
+            break
+
+    flush()
+    if len(chunks) > max_chunks:
+        chunks = chunks[:max_chunks]
+    return chunks
+
+def _strip_think(text: str) -> str:
+    return re.sub(r"<think>[\s\S]*?</think>", "", text or "").strip()
+
+def _clean_json_like(text: str) -> str:
+    text = (text or "").strip()
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    return text.strip()
+
+def _balanced_json_substrings(text: str) -> list[str]:
+    text = text or ""
+    candidates: list[str] = []
+    for start_char, end_char in [("{", "}"), ("[", "]")]:
+        start_positions = [m.start() for m in re.finditer(re.escape(start_char), text)]
+        for start in start_positions[:30]:
+            depth = 0
+            in_string = False
+            escape = False
+            for i in range(start, len(text)):
+                c = text[i]
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif c == "\\":
+                        escape = True
+                    elif c == '"':
+                        in_string = False
+                    continue
+                if c == '"':
+                    in_string = True
+                    continue
+                if c == start_char:
+                    depth += 1
+                elif c == end_char:
+                    depth -= 1
+                    if depth == 0:
+                        frag = text[start : i + 1].strip()
+                        if frag:
+                            candidates.append(frag)
+                        break
+    return candidates
+
+def _extract_json_candidates(text: str) -> list[str]:
+    text = _strip_think(text)
+    candidates: list[str] = []
+
+    fenced = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+    for block in fenced:
+        block = block.strip()
+        if block:
+            candidates.append(block)
+
+    candidates.extend(_balanced_json_substrings(text))
+
+    raw = text.strip()
+    if raw and raw[0] in "{[":
+        candidates.append(raw)
+    return candidates
+
+def _robust_json_loads(text: str):
+    last_err: Exception | None = None
+    for cand in _extract_json_candidates(text):
+        cand = _clean_json_like(cand)
+        if not cand:
+            continue
+        try:
+            return json.loads(cand)
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    raise json.JSONDecodeError("No JSON candidate found", text or "", 0)
+
+def _deep_merge(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = dict(a)
+        for k, v in b.items():
+            out[k] = _deep_merge(out.get(k), v)
+        return out
+    if isinstance(a, list) and isinstance(b, list):
+        out = list(a)
+        for item in b:
+            if item not in out:
+                out.append(item)
+        return out
+    if isinstance(a, str) and isinstance(b, str):
+        a2 = a.strip()
+        b2 = b.strip()
+        if not a2:
+            return b
+        if not b2:
+            return a
+        return b if len(b2) >= len(a2) else a
+    return b
+
+def _hierarchical_summarize(text: str, ai_model: str | None, target_chars: int) -> str:
+    text = _normalize_text(text)
+    if not text:
+        return ""
+    if len(text) <= target_chars:
+        return text
+
+    chunk_size = _env_int("AI_CHUNK_SIZE_CHARS", 8000)
+    overlap = _env_int("AI_CHUNK_OVERLAP_CHARS", 400)
+    max_chunks = _env_int("AI_MAX_CHUNKS", 8)
+
+    chunks = _split_text_into_chunks(text, chunk_size, overlap, max_chunks)
+    summaries: list[str] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        prompt = (
+            "你是信息抽取助手。请仅基于这段内容，提炼可用于后续结构化抽取的关键信息，要求：\n"
+            "1) 输出为要点列表，每条不超过 80 字；2) 保留关键实体、时间、金额、条款编号、层级标题；\n"
+            "3) 不要编造；4) 不要输出除要点外的任何解释。\n\n"
+            f"【片段 {idx}/{len(chunks)}】\n{chunk}"
+        )
+        s = ai_client.generate_completion(prompt, model=ai_model)
+        s = _normalize_text(_strip_think(s))
+        if s:
+            summaries.append(s)
+
+    merged = _normalize_text("\n".join(summaries))
+    if len(merged) <= target_chars:
+        return merged
+
+    prompt2 = (
+        "请将以下要点再压缩为更短的要点列表，要求：\n"
+        "1) 保留字段抽取所需的实体、数字、条款编号、章节层级；2) 不要编造；3) 只输出要点。\n\n"
+        f"{merged}"
+    )
+    s2 = ai_client.generate_completion(prompt2, model=ai_model)
+    return _normalize_text(_strip_think(s2))
+
+def _docx_iter_block_items(doc: Document):
+    body = doc.element.body
+    for child in body.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, doc)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, doc)
+
+def _docx_paragraph_to_markdown(para: Paragraph) -> str:
+    text = (para.text or "").strip()
+    if not text:
+        return ""
+    style_name = (getattr(getattr(para, "style", None), "name", None) or "").strip().lower()
+    if style_name in {"title", "标题"}:
+        return f"# {text}"
+    m = re.match(r"heading\s*(\d+)", style_name)
+    if m:
+        level = int(m.group(1))
+        level = min(max(level, 1), 6)
+        return f"{'#' * level} {text}"
+    return text
+
+def _docx_table_to_markdown(table: Table) -> str:
+    rows: list[list[str]] = []
+    for row in table.rows:
+        row_vals: list[str] = []
+        for cell in row.cells:
+            cell_text = _normalize_text(cell.text)
+            row_vals.append(cell_text.replace("\n", "<br>") if cell_text else "")
+        rows.append(row_vals)
+    if not rows:
+        return ""
+
+    max_cols = max((len(r) for r in rows), default=0)
+    if max_cols <= 0:
+        return ""
+    for r in rows:
+        if len(r) < max_cols:
+            r.extend([""] * (max_cols - len(r)))
+
+    header = rows[0]
+    has_header = any(v.strip() for v in header)
+    if not has_header:
+        header = [f"列{i+1}" for i in range(max_cols)]
+        data_rows = rows
+    else:
+        data_rows = rows[1:] if len(rows) > 1 else []
+
+    def fmt_row(r: list[str]) -> str:
+        return "| " + " | ".join([v.replace("|", "\\|") for v in r]) + " |"
+
+    out = [fmt_row(header), "| " + " | ".join(["---"] * max_cols) + " |"]
+    for r in data_rows:
+        out.append(fmt_row(r))
+    return "\n".join(out)
+
+def _extract_pdf_text(file_content: bytes) -> tuple[str, dict]:
+    pdf_doc = fitz.open(stream=file_content, filetype="pdf")
+    pages: list[str] = []
+    for i, page in enumerate(pdf_doc, start=1):
+        blocks = page.get_text("blocks") or []
+        blocks_sorted = sorted(blocks, key=lambda b: (b[1], b[0]))
+        parts = []
+        for b in blocks_sorted:
+            t = (b[4] or "").strip()
+            if t:
+                parts.append(t)
+        text = _normalize_text("\n".join(parts)) if parts else _normalize_text(page.get_text() or "")
+        if text:
+            pages.append(f"--- Page {i} ---\n{text}")
+    meta = {"pages": pdf_doc.page_count}
+    pdf_doc.close()
+    return (_normalize_text("\n\n".join(pages)), meta)
+
+def _extract_docx_text(file_content: bytes) -> tuple[str, dict]:
+    doc = Document(io.BytesIO(file_content))
+    parts: list[str] = []
+    para_count = 0
+    table_count = 0
+    for block in _docx_iter_block_items(doc):
+        if isinstance(block, Paragraph):
+            md = _docx_paragraph_to_markdown(block)
+            if md:
+                parts.append(md)
+                para_count += 1
+        elif isinstance(block, Table):
+            md = _docx_table_to_markdown(block)
+            if md:
+                parts.append(md)
+                table_count += 1
+    return (_normalize_text("\n\n".join(parts)), {"paragraphs": para_count, "tables": table_count})
+
+def _infer_template_type(text: str) -> str:
+    t = (text or "").lower()
+    score = {
+        "resume": 0,
+        "report": 0,
+        "meeting": 0,
+        "contract": 0,
+        "proposal": 0,
+        "invoice": 0,
+    }
+    for kw in ["简历", "教育背景", "工作经历", "自我评价", "技能"]:
+        if kw in t:
+            score["resume"] += 1
+    for kw in ["项目概述", "项目目标", "实施过程", "主要成果", "总结", "报告"]:
+        if kw in t:
+            score["report"] += 1
+    for kw in ["会议纪要", "参会", "会议时间", "议题", "决议", "行动项"]:
+        if kw in t:
+            score["meeting"] += 1
+    for kw in ["合同", "甲方", "乙方", "违约", "争议解决", "付款"]:
+        if kw in t:
+            score["contract"] += 1
+    for kw in ["提案", "项目背景", "实施方案", "预算", "风险评估", "时间计划"]:
+        if kw in t:
+            score["proposal"] += 1
+    for kw in ["发票", "金额", "税", "开票", "商品/服务"]:
+        if kw in t:
+            score["invoice"] += 1
+    best = max(score.items(), key=lambda x: x[1])
+    return best[0] if best[1] > 0 else "default"
 
 async def download_file_from_backend(file_id: str) -> bytes:
     url = f"{BACKEND_URL}/files/{file_id}/download"
@@ -201,29 +526,79 @@ def parse_ai_content_for_template(content: str, template_type: str, ai_model: st
     if not prompt:
         return {"raw_content": content}
     
-    full_prompt = prompt + content
-    ai_response = ai_client.generate_completion(full_prompt, model=ai_model)
-    
+    strict_suffix = "\n\n要求：只输出严格的 JSON（不要代码块、不要说明文字）。"
+
+    max_direct = _env_int("AI_MAX_DIRECT_EXTRACT_CHARS", 12000)
+    content_norm = _normalize_text(content)
+    use_chunked = len(content_norm) > max_direct
+
+    if use_chunked:
+        extract_chunk_size = _env_int("AI_EXTRACT_CHUNK_SIZE_CHARS", 9000)
+        overlap = _env_int("AI_EXTRACT_CHUNK_OVERLAP_CHARS", 400)
+        max_chunks = _env_int("AI_EXTRACT_MAX_CHUNKS", _env_int("AI_MAX_CHUNKS", 8))
+        chunks = _split_text_into_chunks(content_norm, extract_chunk_size, overlap, max_chunks)
+
+        merged: dict = {}
+        parsed_any = False
+        for idx, chunk in enumerate(chunks, start=1):
+            chunk_prompt = (
+                prompt
+                + chunk
+                + "\n\n补充要求：仅基于该片段抽取，不要推断不存在的信息；缺失字段留空。"
+                + strict_suffix
+                + f"\n\n【片段 {idx}/{len(chunks)}】"
+            )
+            ai_resp = _strip_think(ai_client.generate_completion(chunk_prompt, model=ai_model))
+            try:
+                partial = _robust_json_loads(ai_resp)
+                if isinstance(partial, dict):
+                    merged = _deep_merge(merged, partial)
+                    parsed_any = True
+            except Exception:
+                continue
+
+        if parsed_any:
+            merged["__source_length"] = len(content_norm)
+            merged["__chunked"] = True
+            merged["__chunks"] = len(chunks)
+            return merged
+
+        target_chars = _env_int("AI_SUMMARY_TARGET_CHARS", 12000)
+        content_for_ai = _hierarchical_summarize(content_norm, ai_model=ai_model, target_chars=target_chars)
+    else:
+        content_for_ai = content_norm
+
+    full_prompt = prompt + content_for_ai + strict_suffix
+    ai_response = _strip_think(ai_client.generate_completion(full_prompt, model=ai_model))
+
     try:
-        # 移除 <think>...</think> 标签
-        import re
-        ai_response = re.sub(r'<think>[\s\S]*?</think>', '', ai_response).strip()
-        
-        # 提取JSON
-        if "```json" in ai_response:
-            ai_response = ai_response.split("```json")[1].split("```")[0].strip()
-        elif "```" in ai_response:
-            ai_response = ai_response.split("```")[1].split("```")[0].strip()
-        
-        # 尝试找到 JSON 对象
-        json_match = re.search(r'\{[\s\S]*\}', ai_response)
-        if json_match:
-            return json.loads(json_match.group())
-        return json.loads(ai_response)
-    except json.JSONDecodeError as e:
-        print(f"Failed to parse AI response as JSON: {ai_response[:500]}, error: {e}")
-        # 如果解析失败，尝试从原始内容创建基本结构
-        return {"raw_content": content, "title": "文档", "sections": {"内容": content[:2000]}}
+        data = _robust_json_loads(ai_response)
+        if isinstance(data, dict):
+            data["__source_length"] = len(content or "")
+        return data
+    except Exception as e:
+        repair_prompt = (
+            "请把下面内容修正为严格 JSON，必须与用户要求的 JSON 结构保持一致，且只输出 JSON。\n\n"
+            f"{ai_response}"
+        )
+        repaired = ai_client.generate_completion(repair_prompt, model=ai_model)
+        repaired = _strip_think(repaired)
+        try:
+            data = _robust_json_loads(repaired)
+            if isinstance(data, dict):
+                data["__source_length"] = len(content or "")
+                data["__repaired"] = True
+            return data
+        except Exception:
+            excerpt_head = (content or "")[:20000]
+            excerpt_tail = (content or "")[-5000:] if (content and len(content) > 25000) else ""
+            return {
+                "raw_content_excerpt": _normalize_text(excerpt_head + ("\n\n...[TRUNCATED]...\n\n" + excerpt_tail if excerpt_tail else "")),
+                "title": "文档",
+                "sections": {"内容": _normalize_text(excerpt_head)},
+                "__parse_error": str(e),
+                "__source_length": len(content or "")
+            }
 
 def create_document_from_content(content: str, template_type: str = 'default', ai_model: str | None = None) -> bytes:
     """根据内容和模板类型创建文档，使用AI解析内容填充模板"""
@@ -548,101 +923,128 @@ async def _analyze_document_logic(file_id: str, analysis_type: str, ai_model: st
     
     if not file_content:
         return {"error": "Failed to download document"}
-    
-    prompt = f"""
-    请分析文档（ID: {file_id}）。
-    分析类型：{analysis_type}
-    
-    如果分析类型是 'structure'，返回包含章节和层级的 JSON。
-    如果分析类型是 'style'，返回包含字体、颜色、间距的 JSON。
-    如果分析类型是 'content'，返回摘要。
-    
-    请以 JSON 格式返回结果。
-    """
-    
-    ai_response = ai_client.generate_completion(prompt, model=ai_model)
-    
-    try:
-        if "```json" in ai_response:
-            ai_response = ai_response.split("```json")[1].split("```")[0].strip()
-        elif "```" in ai_response:
-            ai_response = ai_response.split("```")[1].split("```")[0].strip()
-        return json.loads(ai_response)
-    except:
-        return {"raw_analysis": ai_response}
 
-async def _extract_content_logic(file_id: str, format: str):
+    extracted_text = ""
+    meta: dict = {}
+    try:
+        extracted_text, meta = _extract_pdf_text(file_content)
+        meta["detected_type"] = "pdf"
+    except Exception:
+        try:
+            extracted_text, meta = _extract_docx_text(file_content)
+            meta["detected_type"] = "docx"
+        except Exception:
+            try:
+                extracted_text = file_content.decode("utf-8", errors="ignore")
+                meta["detected_type"] = "text"
+            except Exception:
+                extracted_text = ""
+                meta["detected_type"] = "unknown"
+
+    extracted_text = _normalize_text(extracted_text)
+    max_for_ai = _env_int("AI_ANALYSIS_MAX_CHARS", 20000)
+    if len(extracted_text) > max_for_ai:
+        extracted_text = _hierarchical_summarize(extracted_text, ai_model=ai_model, target_chars=_env_int("AI_ANALYSIS_TARGET_CHARS", 12000))
+
+    prompt = (
+        f"请分析下面的文档内容（file_id: {file_id}）。分析类型：{analysis_type}\n\n"
+        "输出要求：只输出严格 JSON（不要代码块、不要说明文字）。\n"
+        "1) structure：返回章节标题、层级、可能的编号、关键表格/附件提示；\n"
+        "2) style：返回可观察到的排版风格（标题层级、列表、表格、引用等），不要凭空臆测字体颜色；\n"
+        "3) content：返回 200-400 字摘要 + 10 条关键要点。\n\n"
+        f"【内容】\n{extracted_text}"
+    )
+
+    ai_response = _strip_think(ai_client.generate_completion(prompt, model=ai_model))
+    try:
+        return _robust_json_loads(ai_response)
+    except Exception:
+        return {"raw_analysis": ai_response, "metadata": meta}
+
+async def _extract_content_with_meta(file_id: str, format: str) -> tuple[str, dict]:
     try:
         file_content = await download_file_from_backend(file_id)
     except Exception as e:
-        return f"无法提取内容：文档 {file_id} 下载失败 - {str(e)}"
+        return (f"无法提取内容：文档 {file_id} 下载失败 - {str(e)}", {"error": str(e)})
     
     try:
-        # 尝试检测文件类型
-        content = []
-        
-        # 先尝试作为 PDF 解析
         try:
-            pdf_doc = fitz.open(stream=file_content, filetype="pdf")
-            for page in pdf_doc:
-                text = page.get_text()
-                if text.strip():
-                    content.append(text.strip())
-            pdf_doc.close()
-            if content:
-                if format == "markdown":
-                    return "\n\n".join(content)
-                elif format == "plain":
-                    return "\n".join(content)
-                else:
-                    return "\n\n".join(content)
-        except Exception:
-            pass  # 不是 PDF，尝试其他格式
-        
-        # 尝试作为 DOCX 解析
-        try:
-            doc = Document(io.BytesIO(file_content))
-            for para in doc.paragraphs:
-                if para.text.strip():
-                    content.append(para.text.strip())
-            if content:
-                if format == "markdown":
-                    return "\n\n".join([f"{p}" for p in content])
-                elif format == "plain":
-                    return "\n".join(content)
-                else:
-                    return "\n\n".join(content)
-        except Exception:
-            pass  # 不是 DOCX
-        
-        # 尝试作为纯文本解析
-        try:
-            text = file_content.decode('utf-8')
-            if text.strip():
-                return text.strip()
+            text, meta = _extract_pdf_text(file_content)
+            if text:
+                meta["detected_type"] = "pdf"
+                return (text if format in {"markdown", "plain"} else text, meta)
         except Exception:
             pass
         
-        return f"无法识别文件格式或文件内容为空"
+        try:
+            text, meta = _extract_docx_text(file_content)
+            if text:
+                meta["detected_type"] = "docx"
+                return (text if format in {"markdown", "plain"} else text, meta)
+        except Exception:
+            pass
+        
+        try:
+            text = file_content.decode("utf-8", errors="ignore")
+            if text.strip():
+                return (_normalize_text(text), {"detected_type": "text"})
+        except Exception:
+            pass
+        
+        return (f"无法识别文件格式或文件内容为空", {"detected_type": "unknown"})
     except Exception as e:
-        return f"提取内容失败：{str(e)}"
+        return (f"提取内容失败：{str(e)}", {"error": str(e)})
+
+async def _extract_content_logic(file_id: str, format: str):
+    text, _meta = await _extract_content_with_meta(file_id, format)
+    text = _normalize_text(text)
+    max_ret = _env_int("CONTENT_EXTRACTOR_MAX_RETURN_CHARS", 200000)
+    head = _env_int("CONTENT_EXTRACTOR_HEAD_CHARS", 120000)
+    tail = _env_int("CONTENT_EXTRACTOR_TAIL_CHARS", 40000)
+    if max_ret > 0 and len(text) > max_ret and head > 0 and tail > 0:
+        head_text = text[:head]
+        tail_text = text[-tail:]
+        text = _normalize_text(head_text + "\n\n...[TRUNCATED]...\n\n" + tail_text)
+    return text
 
 async def _match_template_logic(content_file_ids: list[str], template_file_id: str, keep_styles: bool, ai_model: str | None = None):
-    prompt = f"""
-    我有内容文件：{content_file_ids}
-    和模板文件：{template_file_id}
-    要求：将内容合并到模板中。保留样式：{keep_styles}。
-    
-    请提供合并策略计划，以 JSON 格式返回。
-    """
+    content_summaries: list[dict] = []
+    for fid in content_file_ids[:10]:
+        try:
+            text, meta = await _extract_content_with_meta(fid, "markdown")
+            text = _normalize_text(text)
+            if len(text) > _env_int("AI_MATCHER_MAX_CHARS_PER_FILE", 12000):
+                text = _hierarchical_summarize(text, ai_model=ai_model, target_chars=_env_int("AI_MATCHER_TARGET_CHARS_PER_FILE", 6000))
+            content_summaries.append({"file_id": fid, "summary": text, "metadata": meta})
+        except Exception as e:
+            content_summaries.append({"file_id": fid, "error": str(e)})
+
+    template_summary = ""
+    template_meta: dict = {}
+    if template_file_id and template_file_id != "none":
+        try:
+            t, template_meta = await _extract_content_with_meta(template_file_id, "markdown")
+            t = _normalize_text(t)
+            if len(t) > _env_int("AI_MATCHER_MAX_CHARS_TEMPLATE", 16000):
+                t = _hierarchical_summarize(t, ai_model=ai_model, target_chars=_env_int("AI_MATCHER_TARGET_CHARS_TEMPLATE", 8000))
+            template_summary = t
+        except Exception as e:
+            template_summary = ""
+            template_meta = {"error": str(e)}
+
+    prompt = (
+        "你是文档合并与排版策略助手。\n"
+        f"目标：将多个内容文件合并到模板中，保留样式：{keep_styles}。\n"
+        "请输出严格 JSON（不要代码块、不要说明文字），包含：\n"
+        '1) "sections_mapping": 章节/条款映射；2) "tables": 表格如何迁移；3) "notes": 风险与缺失字段；4) "order": 推荐章节顺序。\n\n'
+        f"【模板摘要】\n{template_summary}\n\n【内容摘要】\n{json.dumps(content_summaries, ensure_ascii=False)}"
+    )
     
     ai_response = ai_client.generate_completion(prompt, model=ai_model)
     try:
-        if "```json" in ai_response:
-            ai_response = ai_response.split("```json")[1].split("```")[0].strip()
-        return json.loads(ai_response)
+        return _robust_json_loads(ai_response)
     except:
-        return {"plan": ai_response}
+        return {"plan": ai_response, "template_metadata": template_meta}
 
 async def _generate_document_logic(content: str, template_file_id: str, output_format: str, preset_template: str | None = None, ai_model: str | None = None) -> dict:
     template_type = 'default'
@@ -700,10 +1102,21 @@ async def _modify_document_logic(file_id: str, modifications: str, ai_model: str
         print(error_msg)
         return {"error": error_msg}
 
+async def _structured_extractor_logic(file_id: str, template_type: str | None = None, ai_model: str | None = None) -> dict:
+    text, meta = await _extract_content_with_meta(file_id, "markdown")
+    text = _normalize_text(text)
+
+    inferred = template_type or "auto"
+    if inferred == "auto":
+        inferred = _infer_template_type(text[:20000])
+
+    parsed = parse_ai_content_for_template(text, inferred, ai_model=ai_model)
+    return {"template_type": inferred, "data": parsed, "metadata": meta, "content_length": len(text)}
+
 @mcp.tool()
-async def document_analyzer(file_id: str, analysis_type: str = "structure") -> str:
+async def document_analyzer(file_id: str, analysis_type: str = "structure", ai_model: str | None = None) -> str:
     """分析文档结构、内容类型或样式。"""
-    result = await _analyze_document_logic(file_id, analysis_type)
+    result = await _analyze_document_logic(file_id, analysis_type, ai_model=ai_model)
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 @mcp.tool()
@@ -713,21 +1126,27 @@ async def content_extractor(file_id: str, format: str = "markdown") -> str:
     return result
 
 @mcp.tool()
-async def template_matcher(content_file_ids: list[str], template_file_id: str, keep_styles: bool = True) -> str:
+async def template_matcher(content_file_ids: list[str], template_file_id: str, keep_styles: bool = True, ai_model: str | None = None) -> str:
     """将内容与模板匹配并生成布局计划。"""
-    result = await _match_template_logic(content_file_ids, template_file_id, keep_styles)
+    result = await _match_template_logic(content_file_ids, template_file_id, keep_styles, ai_model=ai_model)
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 @mcp.tool()
-async def document_generator(content: str, template_file_id: str, output_format: str = "docx", preset_template: str | None = None) -> str:
+async def document_generator(content: str, template_file_id: str, output_format: str = "docx", preset_template: str | None = None, ai_model: str | None = None) -> str:
     """生成最终文档。"""
-    result = await _generate_document_logic(content, template_file_id, output_format, preset_template)
+    result = await _generate_document_logic(content, template_file_id, output_format, preset_template, ai_model=ai_model)
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 @mcp.tool()
-async def document_modifier(file_id: str, modifications: str) -> str:
+async def document_modifier(file_id: str, modifications: str, ai_model: str | None = None) -> str:
     """根据修改要求修改现有文档。"""
-    result = await _modify_document_logic(file_id, modifications)
+    result = await _modify_document_logic(file_id, modifications, ai_model=ai_model)
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+@mcp.tool()
+async def structured_extractor(file_id: str, template_type: str = "auto", ai_model: str | None = None) -> str:
+    """对文档做结构化信息抽取。"""
+    result = await _structured_extractor_logic(file_id, template_type, ai_model=ai_model)
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 from fastapi import FastAPI
@@ -779,6 +1198,14 @@ async def list_tools() -> list[Tool]:
                 "modifications": {"type": "string"}
             }
         }),
+        Tool(name="structured_extractor", description="结构化信息抽取", inputSchema={
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string"},
+                "template_type": {"type": "string"},
+                "ai_model": {"type": "string"}
+            }
+        }),
     ]
 
 @mcp_server.call_tool()
@@ -798,6 +1225,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     elif name == "document_modifier":
         res = await _modify_document_logic(arguments["file_id"], arguments["modifications"])
         return [TextContent(type="text", text=json.dumps(res, indent=2, ensure_ascii=False))]
+    elif name == "structured_extractor":
+        res = await _structured_extractor_logic(arguments["file_id"], arguments.get("template_type", "auto"), ai_model=arguments.get("ai_model"))
+        return [TextContent(type="text", text=json.dumps(res, indent=2, ensure_ascii=False))]
     return []
 
 @app.post("/api/tools/{name}/invoke")
@@ -806,13 +1236,27 @@ async def invoke_tool(name: str, arguments: dict):
     if name == "document_analyzer":
         return await _analyze_document_logic(arguments["file_id"], arguments.get("analysis_type", "structure"), ai_model=ai_model)
     elif name == "content_extractor":
-        return {"content": await _extract_content_logic(arguments["file_id"], arguments.get("format", "markdown"))}
+        content, meta = await _extract_content_with_meta(arguments["file_id"], arguments.get("format", "markdown"))
+        content = _normalize_text(content)
+        max_ret = _env_int("CONTENT_EXTRACTOR_MAX_RETURN_CHARS", 200000)
+        head = _env_int("CONTENT_EXTRACTOR_HEAD_CHARS", 120000)
+        tail = _env_int("CONTENT_EXTRACTOR_TAIL_CHARS", 40000)
+        truncated = False
+        if max_ret > 0 and len(content) > max_ret and head > 0 and tail > 0:
+            content = _normalize_text(content[:head] + "\n\n...[TRUNCATED]...\n\n" + content[-tail:])
+            truncated = True
+        meta = dict(meta or {})
+        meta["content_length"] = len(content)
+        meta["truncated"] = truncated
+        return {"content": content, "metadata": meta}
     elif name == "template_matcher":
         return await _match_template_logic(arguments["content_file_ids"], arguments["template_file_id"], arguments.get("keep_styles", True), ai_model=ai_model)
     elif name == "document_generator":
         return await _generate_document_logic(arguments["content"], arguments["template_file_id"], arguments.get("output_format", "docx"), arguments.get("preset_template"), ai_model=ai_model)
     elif name == "document_modifier":
         return await _modify_document_logic(arguments["file_id"], arguments["modifications"], ai_model=ai_model)
+    elif name == "structured_extractor":
+        return await _structured_extractor_logic(arguments["file_id"], arguments.get("template_type", "auto"), ai_model=ai_model)
     raise HTTPException(status_code=404, detail="Tool not found")
 
 if __name__ == "__main__":
