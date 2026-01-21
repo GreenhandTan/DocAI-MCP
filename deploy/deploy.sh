@@ -16,7 +16,11 @@ if [ ! -f ".env" ]; then
 fi
 
 echo "步骤 1/5: 清理旧容器和镜像..."
-docker-compose down -v
+if [ "${RESET_VOLUMES:-}" = "1" ]; then
+    docker-compose down -v
+else
+    docker-compose down
+fi
 
 echo ""
 echo "步骤 2/5: 构建镜像..."

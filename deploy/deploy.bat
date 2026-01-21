@@ -57,7 +57,11 @@ echo [信息] 使用命令: %COMPOSE_CMD%
 echo.
 
 echo 步骤 1/5: 清理旧容器和镜像...
-%COMPOSE_CMD% down -v
+if "%RESET_VOLUMES%"=="1" (
+    %COMPOSE_CMD% down -v
+) else (
+    %COMPOSE_CMD% down
+)
 if %errorlevel% neq 0 (
     echo [警告] 清理过程中出现问题，继续执行...
 )

@@ -58,6 +58,7 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] | None = None
     file_ids: list[str] | None = None
     template_file_id: str | None = None
+    template_text: str | None = None
     preset_template: str | None = None
     model: str | None = None
 
@@ -293,54 +294,100 @@ async def ai_chat_stream(payload: ChatRequest, db: AsyncSession = Depends(get_db
     if not user_text:
         raise HTTPException(status_code=400, detail="message 不能为空")
 
-    # 提取文件内容
-    file_contents = []
-    if payload.file_ids:
-        for file_id in payload.file_ids:
-            try:
-                # 调用 MCP 服务提取内容
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    resp = await client.post(
-                        "http://mcp-server:3000/api/tools/content_extractor/invoke",
-                        json={"file_id": file_id, "format": "markdown"}
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        content = data.get("content", "")
-                        if content:
-                            # 移除 "无法" 检查，允许错误信息传递给 AI，以便 AI 解释原因
-                            file_contents.append(f"【文档内容】:\n{content}")
-            except Exception as e:
-                file_contents.append(f"【文档 {file_id}】: 内容提取失败 - {str(e)}")
-
-    # 构建消息列表
-    messages = []
-    
-    # 1. 系统消息（包含文档内容）
-    system_content = "你是一个智能文档助手。请根据用户提供的文档内容和需求进行回答。"
-    if file_contents:
-        docs_text = "\n\n".join(file_contents)
-        template_text = payload.preset_template or "无"
-        system_content += f"\n\n以下是用户上传的文档内容：\n\n{docs_text}\n\n用户选择的模板类型：{template_text}"
-    elif payload.file_ids:
-        file_ids_text = ", ".join(payload.file_ids)
-        system_content += f"\n\n用户上传了文档（ID: {file_ids_text}），但内容提取失败。请提示用户检查文档。"
-        
-    messages.append({"role": "system", "content": system_content})
-    
-    # 2. 历史消息
-    if payload.history:
-        for msg in payload.history:
-            # 过滤掉空消息或思考过程
-            if msg.content:
-                messages.append({"role": msg.role, "content": msg.content})
-            
-    # 3. 当前用户消息
-    messages.append({"role": "user", "content": user_text})
-
     async def generate():
         yield f"data: {json.dumps({'type': 'thinking', 'content': '正在思考...'}, ensure_ascii=False)}\n\n"
         try:
+            async def _extract_via_mcp(file_id: str) -> str:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.post(
+                        "http://mcp-server:3000/api/tools/content_extractor/invoke",
+                        json={"file_id": file_id, "format": "markdown"},
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        return (data.get("content") or "").strip()
+                    return f"内容提取失败（HTTP {resp.status_code}）：{(resp.text or '')[:200]}"
+
+            async def _condense_template_text(template_raw: str) -> str:
+                text = (template_raw or "").strip()
+                if not text:
+                    return ""
+                if len(text) <= 12000:
+                    return text
+                prompt = (
+                    "请将下面“模板描述”整理为一个可执行的输出模板（用于总结/结构化输出），要求：\n"
+                    "1) 输出为分级要点（1./1.1/1.2...）；2) 保留字段名、顺序、约束；3) 不要编造；4) 尽量压缩在 1500 字以内。\n\n"
+                    f"{text}"
+                )
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(
+                        url,
+                        headers={"Authorization": f"Bearer {settings.AI_API_KEY}"},
+                        json={"model": model, "messages": [{"role": "user", "content": prompt}], "stream": False},
+                    )
+                    if resp.status_code >= 400:
+                        return text[:12000]
+                    data = resp.json()
+                    try:
+                        return (data["choices"][0]["message"]["content"] or "").strip()
+                    except Exception:
+                        return text[:12000]
+
+            file_contents: list[str] = []
+            if payload.file_ids:
+                for file_id in payload.file_ids:
+                    try:
+                        content = await _extract_via_mcp(file_id)
+                        if content:
+                            file_contents.append(f"【文档内容】:\n{content}")
+                    except Exception as e:
+                        file_contents.append(f"【文档 {file_id}】: 内容提取失败 - {str(e)}")
+
+            template_spec_blocks: list[str] = []
+            if payload.preset_template:
+                template_spec_blocks.append(f"【模板类型】{payload.preset_template}")
+
+            if payload.template_file_id:
+                try:
+                    tcontent = await _extract_via_mcp(payload.template_file_id)
+                    if tcontent:
+                        tcontent = await _condense_template_text(tcontent)
+                        template_spec_blocks.append(f"【模板文件内容】\n{tcontent}")
+                    else:
+                        template_spec_blocks.append("【模板文件内容】获取失败或为空")
+                except Exception as e:
+                    template_spec_blocks.append(f"【模板文件内容】提取失败：{str(e)}")
+
+            if payload.template_text:
+                ttext = await _condense_template_text(payload.template_text)
+                if ttext:
+                    template_spec_blocks.append(f"【模板描述文本】\n{ttext}")
+
+            messages: list[dict] = []
+            system_content = (
+                "你是一个智能文档助手。请根据用户提供的文档内容与模板要求进行总结与输出。\n"
+                "要求：优先严格按照模板输出；模板未覆盖的内容可追加“补充信息”。缺失字段请输出“无”。"
+            )
+
+            if template_spec_blocks:
+                system_content += "\n\n以下是用户提供的模板信息：\n" + "\n\n".join(template_spec_blocks)
+
+            if file_contents:
+                docs_text = "\n\n".join(file_contents)
+                system_content += f"\n\n以下是用户上传的文档内容：\n\n{docs_text}"
+            elif payload.file_ids:
+                file_ids_text = ", ".join(payload.file_ids)
+                system_content += f"\n\n用户上传了文档（ID: {file_ids_text}），但内容提取失败。请提示用户检查文档。"
+
+            messages.append({"role": "system", "content": system_content})
+
+            if payload.history:
+                for msg in payload.history:
+                    if msg.content:
+                        messages.append({"role": msg.role, "content": msg.content})
+
+            messages.append({"role": "user", "content": user_text})
+
             # 设置合理的超时：连接10秒，读取120秒（AI模型可能需要较长时间响应）
             timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
             async with httpx.AsyncClient(timeout=timeout) as client:
@@ -408,7 +455,18 @@ async def download_file(request: Request, file_id: str, db: AsyncSession = Depen
         raise HTTPException(status_code=404, detail="Document not found")
 
     bucket = settings.MINIO_BUCKET_UPLOADS
-    object_name = doc.minio_path.split("/")[-1]
+    object_name = doc.minio_path
+    if doc.minio_path and "/" in doc.minio_path:
+        prefix, rest = doc.minio_path.split("/", 1)
+        if prefix == settings.MINIO_BUCKET_OUTPUTS or prefix == "outputs":
+            bucket = settings.MINIO_BUCKET_OUTPUTS
+            object_name = rest
+        elif prefix == settings.MINIO_BUCKET_UPLOADS or prefix == "uploads":
+            bucket = settings.MINIO_BUCKET_UPLOADS
+            object_name = rest
+        else:
+            object_name = rest
+    object_name = object_name.split("/")[-1]
 
     try:
         # stat = minio_client.client.stat_object(bucket, object_name)
@@ -420,6 +478,8 @@ async def download_file(request: Request, file_id: str, db: AsyncSession = Depen
         total_size = int(doc.file_size or 0)
 
     range_header = request.headers.get("range")
+    if range_header and total_size <= 0:
+        range_header = None
 
     def _stream_object(offset: int | None = None, length: int | None = None):
         response = minio_client.client.get_object(bucket, object_name, offset=offset, length=length)

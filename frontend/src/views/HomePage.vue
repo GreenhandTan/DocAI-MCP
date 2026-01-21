@@ -120,6 +120,8 @@ const presetTemplates = [
 const selectedTemplate = ref<string | null>(null);
 const customTemplateFile = ref<UploadedFile | null>(null);
 const showTemplateMenu = ref(false);
+const useTemplateText = ref(false);
+const customTemplateText = ref("");
 
 let taskTimer: number | null = null;
 
@@ -325,6 +327,8 @@ const toggleTemplate = (templateId: string) => {
     selectedTemplate.value === templateId ? null : templateId;
   if (selectedTemplate.value) {
     customTemplateFile.value = null; // 互斥
+    useTemplateText.value = false;
+    customTemplateText.value = "";
   }
   showTemplateMenu.value = false;
 };
@@ -348,12 +352,21 @@ const handleCustomTemplateUpload = async (event: Event) => {
       created_at: new Date().toISOString(),
     };
     selectedTemplate.value = null; // 互斥
+    useTemplateText.value = false;
+    customTemplateText.value = "";
     showTemplateMenu.value = false;
   } catch (e) {
     console.error("Template upload failed:", e);
   } finally {
     target.value = "";
   }
+};
+
+const enableTemplateText = () => {
+  useTemplateText.value = true;
+  selectedTemplate.value = null;
+  customTemplateFile.value = null;
+  showTemplateMenu.value = false;
 };
 
 // ============ 消息发送（流式） ============
@@ -434,6 +447,7 @@ const sendMessage = async () => {
         file_ids: Array.from(allFileIds),
         preset_template: selectedTemplate.value,
         template_file_id: customTemplateFile.value?.file_id,
+        template_text: useTemplateText.value ? customTemplateText.value : null,
         model: selectedModel.value,
       }),
     });
@@ -579,10 +593,7 @@ const sendMessage = async () => {
     aiMessage.content.startsWith("抱歉，处理请求时出现错误") ||
     aiMessage.content === "AI 响应失败，请稍后重试。";
 
-  const hasFilesOrTemplate =
-    selectedFileIds.value.length > 0 ||
-    selectedTemplate.value ||
-    customTemplateFile.value;
+  const hasFilesOrTemplate = selectedFileIds.value.length > 0;
 
   if (!aiHasError && aiMessage.content.length > 0 && hasFilesOrTemplate) {
     try {
@@ -617,10 +628,8 @@ const sendMessage = async () => {
   isSending.value = false;
   thinkingText.value = "";
 
-  // 清空已选文件和模板
+  // 清空已选文件（模板作为对话上下文保留）
   selectedFileIds.value = [];
-  selectedTemplate.value = null;
-  customTemplateFile.value = null;
 
   await scrollToBottom("auto");
 };
@@ -1229,7 +1238,8 @@ onBeforeUnmount(() => {
               v-if="
                 selectedFiles.length > 0 ||
                 selectedTemplate ||
-                customTemplateFile
+                customTemplateFile ||
+                useTemplateText
               "
               class="px-4 pt-3 flex flex-wrap gap-2"
             >
@@ -1287,6 +1297,19 @@ onBeforeUnmount(() => {
                   <X class="w-3 h-3" />
                 </button>
               </div>
+              <div
+                v-if="useTemplateText"
+                class="flex items-center gap-2 pl-2 pr-1 py-1 bg-amber-50 rounded-lg border border-amber-200"
+              >
+                <span class="text-sm">🧩</span>
+                <span class="text-xs font-medium text-amber-700">文本模板</span>
+                <button
+                  @click="useTemplateText = false; customTemplateText = ''"
+                  class="p-0.5 hover:bg-amber-100 rounded text-amber-600/70 hover:text-amber-800 transition-colors"
+                >
+                  <X class="w-3 h-3" />
+                </button>
+              </div>
             </div>
 
             <!-- 上传中提示 -->
@@ -1300,6 +1323,18 @@ onBeforeUnmount(() => {
 
             <!-- 输入框 -->
             <div class="p-2">
+              <textarea
+                v-if="useTemplateText"
+                v-model="customTemplateText"
+                placeholder="粘贴你的模板描述（越详细越好）。系统会按该模板结构总结文档。"
+                class="w-full resize-none border border-slate-200 rounded-xl outline-none focus:outline-none focus:ring-4 focus:ring-indigo-100 bg-white text-slate-800 placeholder-slate-400 text-sm leading-relaxed px-3 py-2 mb-2 shadow-none appearance-none"
+                rows="3"
+                :style="{
+                  height: 'auto',
+                  maxHeight: '180px',
+                }"
+                @input="(e: Event) => { const t = e.target as HTMLTextAreaElement; t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 180) + 'px'; }"
+              ></textarea>
               <textarea
                 v-model="inputMessage"
                 @compositionstart="isComposing = true"
@@ -1398,6 +1433,19 @@ onBeforeUnmount(() => {
                         @change="handleCustomTemplateUpload"
                       />
                     </label>
+
+                    <button
+                      @click="enableTemplateText"
+                      class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-slate-50 text-left transition-colors"
+                      :class="useTemplateText ? 'bg-indigo-50 text-indigo-700' : 'text-slate-700'"
+                    >
+                      <span class="text-lg">🧩</span>
+                      <span class="text-sm font-medium">使用文本模板</span>
+                      <CheckCircle
+                        v-if="useTemplateText"
+                        class="w-4 h-4 ml-auto text-indigo-600"
+                      />
+                    </button>
                   </div>
                 </div>
               </div>
