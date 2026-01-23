@@ -1183,6 +1183,268 @@ async def _structured_extractor_logic(file_id: str, template_type: str | None = 
     parsed = parse_ai_content_for_template(text, inferred, ai_model=ai_model)
     return {"template_type": inferred, "data": parsed, "metadata": meta, "content_length": len(text)}
 
+
+# ==================== 文档审查工具 ====================
+
+async def _document_reviewer_logic(file_id: str, review_type: str = "general", ai_model: str | None = None) -> dict:
+    """审查文档，识别风险点并生成批注"""
+    text, meta = await _extract_content_with_meta(file_id, "markdown")
+    text = _normalize_text(text)
+    
+    if not text:
+        return {"error": "无法提取文档内容", "annotations": [], "summary": "", "risk_level": "unknown"}
+    
+    # 根据审查类型选择不同的 prompt
+    review_prompts = {
+        "legal": """你是一位资深法务专家。请审查以下文档，识别潜在的法律风险和问题。
+
+审查要点：
+1. 合同条款是否完整（主体、标的、期限、违约责任等）
+2. 是否存在不公平条款或霸王条款
+3. 权利义务是否对等
+4. 争议解决条款是否合理
+5. 是否存在法律漏洞
+
+请以JSON格式返回审查结果：
+{
+    "annotations": [
+        {
+            "position": "第X段/第X条",
+            "original_text": "原文片段",
+            "issue_type": "风险类型",
+            "severity": "high/medium/low",
+            "comment": "问题描述和修改建议"
+        }
+    ],
+    "summary": "整体审查总结（200字以内）",
+    "risk_level": "critical/high/medium/low",
+    "recommendations": ["建议1", "建议2"]
+}
+
+文档内容：
+""",
+        "compliance": """你是一位合规审查专家。请审查以下文档的合规性。
+
+审查要点：
+1. 是否符合相关法规要求
+2. 是否包含必要的声明和披露
+3. 数据隐私和安全条款
+4. 知识产权相关条款
+5. 行业特定合规要求
+
+请以JSON格式返回审查结果：
+{
+    "annotations": [
+        {
+            "position": "第X段/第X条",
+            "original_text": "原文片段",
+            "issue_type": "合规问题类型",
+            "severity": "high/medium/low",
+            "comment": "问题描述和整改建议"
+        }
+    ],
+    "summary": "合规审查总结（200字以内）",
+    "risk_level": "critical/high/medium/low",
+    "compliance_gaps": ["缺失项1", "缺失项2"]
+}
+
+文档内容：
+""",
+        "risk": """你是一位风险评估专家。请审查以下文档中的潜在风险。
+
+审查要点：
+1. 财务风险（付款条款、违约金等）
+2. 运营风险（交付时间、质量标准等）
+3. 声誉风险（保密条款、竞业禁止等）
+4. 技术风险（知识产权、技术转让等）
+5. 不可抗力和意外情况
+
+请以JSON格式返回审查结果：
+{
+    "annotations": [
+        {
+            "position": "第X段/第X条",
+            "original_text": "原文片段",
+            "risk_category": "财务/运营/声誉/技术/其他",
+            "severity": "high/medium/low",
+            "probability": "高/中/低",
+            "impact": "影响描述",
+            "mitigation": "风险缓解建议"
+        }
+    ],
+    "summary": "风险评估总结（200字以内）",
+    "risk_level": "critical/high/medium/low",
+    "risk_matrix": {"high_high": 0, "high_medium": 0, "medium_medium": 0, "low": 0}
+}
+
+文档内容：
+""",
+        "general": """你是一位文档审查专家。请审查以下文档，识别问题和改进建议。
+
+审查要点：
+1. 内容完整性
+2. 逻辑一致性
+3. 表述清晰度
+4. 潜在歧义或模糊之处
+5. 格式和结构问题
+
+请以JSON格式返回审查结果：
+{
+    "annotations": [
+        {
+            "position": "第X段",
+            "original_text": "原文片段",
+            "issue_type": "问题类型",
+            "severity": "high/medium/low",
+            "comment": "问题描述和修改建议"
+        }
+    ],
+    "summary": "审查总结（200字以内）",
+    "risk_level": "high/medium/low",
+    "improvements": ["改进建议1", "改进建议2"]
+}
+
+文档内容：
+"""
+    }
+    
+    prompt = review_prompts.get(review_type, review_prompts["general"])
+    
+    # 如果文档太长，进行摘要
+    max_chars = _env_int("AI_REVIEW_MAX_CHARS", 20000)
+    if len(text) > max_chars:
+        text = _hierarchical_summarize(text, ai_model=ai_model, target_chars=max_chars)
+    
+    full_prompt = prompt + text + "\n\n要求：只输出严格的 JSON（不要代码块、不要说明文字）。"
+    
+    ai_response = _strip_think(ai_client.generate_completion(full_prompt, model=ai_model))
+    
+    try:
+        result = _robust_json_loads(ai_response)
+        result["review_type"] = review_type
+        result["document_length"] = len(text)
+        return result
+    except Exception as e:
+        return {
+            "error": f"解析审查结果失败: {str(e)}",
+            "raw_response": ai_response[:2000],
+            "annotations": [],
+            "summary": "审查完成但结果解析失败",
+            "risk_level": "unknown"
+        }
+
+
+# ==================== AI 处理器工具 ====================
+
+async def _ai_processor_logic(prompt: str, ai_model: str | None = None) -> dict:
+    """通用 AI 处理器，用于工作流中的自定义处理"""
+    if not prompt:
+        return {"error": "Prompt is required", "content": ""}
+    
+    ai_response = _strip_think(ai_client.generate_completion(prompt, model=ai_model))
+    
+    return {
+        "content": ai_response,
+        "prompt_length": len(prompt),
+        "response_length": len(ai_response)
+    }
+
+
+# ==================== 音频转录工具 ====================
+
+async def _audio_transcriber_logic(file_id: str, generate_minutes: bool = True, ai_model: str | None = None) -> dict:
+    """转录音频并可选生成会议纪要"""
+    try:
+        file_content = await download_file_from_backend(file_id)
+    except Exception as e:
+        return {"error": f"下载音频文件失败: {str(e)}", "transcript": ""}
+    
+    # 尝试使用 Whisper 或其他 ASR 服务进行转录
+    # 这里我们提供一个模拟实现，实际使用时需要集成真正的 ASR 服务
+    transcript = ""
+    speakers = []
+    
+    try:
+        # 尝试使用 OpenAI Whisper API 或本地 Whisper
+        # 如果配置了 WHISPER_API_URL，使用远程服务
+        whisper_url = os.getenv("WHISPER_API_URL", "")
+        
+        if whisper_url:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                files = {'file': ('audio.mp3', io.BytesIO(file_content), 'audio/mpeg')}
+                resp = await client.post(
+                    whisper_url,
+                    files=files,
+                    headers={"Authorization": f"Bearer {AI_API_KEY}"} if AI_API_KEY else {}
+                )
+                if resp.status_code == 200:
+                    result = resp.json()
+                    transcript = result.get("text", "")
+                    speakers = result.get("segments", [])
+        else:
+            # 如果没有配置 Whisper，使用 AI 进行模拟（仅用于演示）
+            # 实际生产环境应该集成真正的 ASR 服务
+            transcript = "[音频转录功能需要配置 WHISPER_API_URL 环境变量。请配置 OpenAI Whisper API 或兼容的 ASR 服务。]"
+            
+    except Exception as e:
+        print(f"ASR Error: {e}")
+        transcript = f"[转录失败: {str(e)}]"
+    
+    result = {
+        "transcript": transcript,
+        "speakers": speakers,
+        "audio_file_id": file_id
+    }
+    
+    # 如果需要生成会议纪要
+    if generate_minutes and transcript and not transcript.startswith("["):
+        minutes_prompt = f"""请根据以下会议转录内容，生成一份结构化的会议纪要。
+
+转录内容：
+{transcript}
+
+请以JSON格式返回：
+{{
+    "title": "会议主题",
+    "date": "会议时间（如能识别）",
+    "attendees": ["参会人员列表"],
+    "topics": ["议题1", "议题2"],
+    "discussion": "主要讨论内容摘要",
+    "decisions": ["决议1", "决议2"],
+    "action_items": [
+        {{"item": "待办事项", "owner": "负责人", "deadline": "截止时间"}}
+    ],
+    "summary": "会议总结（200字以内）"
+}}
+
+要求：只输出严格的 JSON。"""
+
+        ai_response = _strip_think(ai_client.generate_completion(minutes_prompt, model=ai_model))
+        
+        try:
+            minutes_data = _robust_json_loads(ai_response)
+            result["summary"] = minutes_data.get("summary", "")
+            result["action_items"] = minutes_data.get("action_items", [])
+            result["minutes_data"] = minutes_data
+            
+            # 生成会议纪要文档
+            doc_content = create_document_from_content(
+                json.dumps(minutes_data, ensure_ascii=False, indent=2),
+                "meeting",
+                ai_model=ai_model
+            )
+            
+            import time
+            timestamp = int(time.time())
+            filename = f"meeting-minutes-{timestamp}.docx"
+            result_file_id = await upload_generated_document(doc_content, filename)
+            result["result_file_id"] = result_file_id
+            
+        except Exception as e:
+            result["minutes_error"] = str(e)
+    
+    return result
+
 @mcp.tool()
 async def document_analyzer(file_id: str, analysis_type: str = "structure", ai_model: str | None = None) -> str:
     """分析文档结构、内容类型或样式。"""
@@ -1217,6 +1479,24 @@ async def document_modifier(file_id: str, modifications: str, ai_model: str | No
 async def structured_extractor(file_id: str, template_type: str = "auto", ai_model: str | None = None) -> str:
     """对文档做结构化信息抽取。"""
     result = await _structured_extractor_logic(file_id, template_type, ai_model=ai_model)
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+@mcp.tool()
+async def document_reviewer(file_id: str, review_type: str = "general", ai_model: str | None = None) -> str:
+    """审查文档，识别风险点并生成批注。review_type: legal/compliance/risk/general"""
+    result = await _document_reviewer_logic(file_id, review_type, ai_model=ai_model)
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+@mcp.tool()
+async def ai_processor(prompt: str, ai_model: str | None = None) -> str:
+    """通用AI处理器，用于自定义处理任务。"""
+    result = await _ai_processor_logic(prompt, ai_model=ai_model)
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+@mcp.tool()
+async def audio_transcriber(file_id: str, generate_minutes: bool = True, ai_model: str | None = None) -> str:
+    """转录音频文件并可选生成会议纪要。"""
+    result = await _audio_transcriber_logic(file_id, generate_minutes, ai_model=ai_model)
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 from fastapi import FastAPI
@@ -1276,6 +1556,29 @@ async def list_tools() -> list[Tool]:
                 "ai_model": {"type": "string"}
             }
         }),
+        Tool(name="document_reviewer", description="审查文档，识别风险点并生成批注", inputSchema={
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string"},
+                "review_type": {"type": "string", "enum": ["legal", "compliance", "risk", "general"]},
+                "ai_model": {"type": "string"}
+            }
+        }),
+        Tool(name="ai_processor", description="通用AI处理器", inputSchema={
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "ai_model": {"type": "string"}
+            }
+        }),
+        Tool(name="audio_transcriber", description="转录音频并生成会议纪要", inputSchema={
+            "type": "object",
+            "properties": {
+                "file_id": {"type": "string"},
+                "generate_minutes": {"type": "boolean"},
+                "ai_model": {"type": "string"}
+            }
+        }),
     ]
 
 @mcp_server.call_tool()
@@ -1297,6 +1600,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=json.dumps(res, indent=2, ensure_ascii=False))]
     elif name == "structured_extractor":
         res = await _structured_extractor_logic(arguments["file_id"], arguments.get("template_type", "auto"), ai_model=arguments.get("ai_model"))
+        return [TextContent(type="text", text=json.dumps(res, indent=2, ensure_ascii=False))]
+    elif name == "document_reviewer":
+        res = await _document_reviewer_logic(arguments["file_id"], arguments.get("review_type", "general"), ai_model=arguments.get("ai_model"))
+        return [TextContent(type="text", text=json.dumps(res, indent=2, ensure_ascii=False))]
+    elif name == "ai_processor":
+        res = await _ai_processor_logic(arguments["prompt"], ai_model=arguments.get("ai_model"))
+        return [TextContent(type="text", text=json.dumps(res, indent=2, ensure_ascii=False))]
+    elif name == "audio_transcriber":
+        res = await _audio_transcriber_logic(arguments["file_id"], arguments.get("generate_minutes", True), ai_model=arguments.get("ai_model"))
         return [TextContent(type="text", text=json.dumps(res, indent=2, ensure_ascii=False))]
     return []
 
@@ -1327,6 +1639,12 @@ async def invoke_tool(name: str, arguments: dict):
         return await _modify_document_logic(arguments["file_id"], arguments["modifications"], ai_model=ai_model)
     elif name == "structured_extractor":
         return await _structured_extractor_logic(arguments["file_id"], arguments.get("template_type", "auto"), ai_model=ai_model)
+    elif name == "document_reviewer":
+        return await _document_reviewer_logic(arguments["file_id"], arguments.get("review_type", "general"), ai_model=ai_model)
+    elif name == "ai_processor":
+        return await _ai_processor_logic(arguments["prompt"], ai_model=ai_model)
+    elif name == "audio_transcriber":
+        return await _audio_transcriber_logic(arguments["file_id"], arguments.get("generate_minutes", True), ai_model=ai_model)
     raise HTTPException(status_code=404, detail="Tool not found")
 
 if __name__ == "__main__":

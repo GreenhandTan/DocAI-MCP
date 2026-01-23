@@ -775,7 +775,7 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- 新建会话按钮 -->
-      <div class="px-4 mb-4">
+      <div class="px-4 mb-2">
         <button
           @click="createNewConversation"
           class="w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 transition-all duration-200 text-white shadow-lg shadow-indigo-900/20 group"
@@ -788,6 +788,18 @@ onBeforeUnmount(() => {
             class="ml-auto text-xs text-indigo-200 bg-indigo-700/50 px-2 py-0.5 rounded"
             >⌘ K</span
           >
+        </button>
+      </div>
+
+      <!-- 高级功能入口 -->
+      <div class="px-4 mb-4">
+        <button
+          @click="router.push('/features')"
+          class="w-full flex items-center gap-3 px-4 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 transition-all duration-200 text-white shadow-lg shadow-purple-900/20"
+        >
+          <Sparkles class="w-5 h-5" />
+          <span class="font-medium">高级功能</span>
+          <span class="ml-auto text-xs text-white/70">审查·工作流·语音</span>
         </button>
       </div>
 

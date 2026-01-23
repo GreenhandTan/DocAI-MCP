@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
-from app.models import Document, ProcessingTask
+from app.models import Document, ProcessingTask, DocumentReview, Workflow, WorkflowExecution, AudioTranscription
 from app.services.minio_client import minio_client
 from app.services.workflow import process_task_background
 from app.core.config import get_settings
@@ -580,3 +580,352 @@ async def get_task_status(
         "resultFileId": str(task.result_file_id) if task.result_file_id else None,
         "error": task.error_message
     }
+
+
+# ==================== 文档审查 API ====================
+
+class ReviewRequest(BaseModel):
+    file_id: str
+    review_type: str = "general"  # legal, compliance, risk, general
+    ai_model: str | None = None
+
+class ReviewResponse(BaseModel):
+    review_id: str
+    status: str
+
+class ReviewResult(BaseModel):
+    review_id: str
+    status: str
+    review_type: str
+    annotations: list | None = None
+    summary: str | None = None
+    risk_level: str | None = None
+    error: str | None = None
+
+
+@router.post("/reviews/create", response_model=ReviewResponse)
+async def create_review(
+    req: ReviewRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """创建文档审查任务"""
+    from app.services.workflow import process_review_background
+    
+    new_review = DocumentReview(
+        id=uuid.uuid4(),
+        user_id=None,
+        document_id=uuid.UUID(req.file_id),
+        review_type=req.review_type,
+        ai_model=req.ai_model,
+        status="pending"
+    )
+    
+    db.add(new_review)
+    await db.commit()
+    await db.refresh(new_review)
+    
+    background_tasks.add_task(process_review_background, str(new_review.id), req.ai_model)
+    
+    return ReviewResponse(review_id=str(new_review.id), status=new_review.status)
+
+
+@router.get("/reviews/{review_id}", response_model=ReviewResult)
+async def get_review(review_id: str, db: AsyncSession = Depends(get_db)):
+    """获取审查结果"""
+    stmt = select(DocumentReview).where(DocumentReview.id == uuid.UUID(review_id))
+    result = await db.execute(stmt)
+    review = result.scalar_one_or_none()
+    
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found")
+    
+    annotations = None
+    if review.annotations:
+        try:
+            annotations = json.loads(review.annotations)
+        except:
+            pass
+    
+    return ReviewResult(
+        review_id=str(review.id),
+        status=review.status,
+        review_type=review.review_type,
+        annotations=annotations,
+        summary=review.summary,
+        risk_level=review.risk_level,
+        error=review.error_message
+    )
+
+
+@router.get("/reviews")
+async def list_reviews(db: AsyncSession = Depends(get_db)):
+    """获取所有审查任务"""
+    stmt = select(DocumentReview).order_by(DocumentReview.created_at.desc())
+    result = await db.execute(stmt)
+    reviews = result.scalars().all()
+    
+    return [
+        {
+            "review_id": str(r.id),
+            "document_id": str(r.document_id),
+            "review_type": r.review_type,
+            "status": r.status,
+            "risk_level": r.risk_level,
+            "created_at": r.created_at.isoformat() if r.created_at else None
+        }
+        for r in reviews
+    ]
+
+
+# ==================== 工作流 API ====================
+
+class WorkflowNode(BaseModel):
+    id: str
+    type: str  # content_extractor, document_analyzer, ai_processor, document_generator, etc.
+    label: str
+    config: dict | None = None
+    position: dict | None = None
+
+class WorkflowEdge(BaseModel):
+    id: str
+    source: str
+    target: str
+
+class WorkflowCreate(BaseModel):
+    name: str
+    description: str | None = None
+    nodes: list[WorkflowNode]
+    edges: list[WorkflowEdge]
+
+class WorkflowExecuteRequest(BaseModel):
+    workflow_id: str
+    input_file_ids: list[str]
+
+
+@router.post("/workflows/create")
+async def create_workflow(
+    workflow_in: WorkflowCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """创建工作流"""
+    new_workflow = Workflow(
+        id=uuid.uuid4(),
+        user_id=None,
+        name=workflow_in.name,
+        description=workflow_in.description,
+        nodes=json.dumps([n.model_dump() for n in workflow_in.nodes], ensure_ascii=False),
+        edges=json.dumps([e.model_dump() for e in workflow_in.edges], ensure_ascii=False),
+        is_active=True
+    )
+    
+    db.add(new_workflow)
+    await db.commit()
+    await db.refresh(new_workflow)
+    
+    return {"workflow_id": str(new_workflow.id), "name": new_workflow.name}
+
+
+@router.get("/workflows")
+async def list_workflows(db: AsyncSession = Depends(get_db)):
+    """获取所有工作流"""
+    stmt = select(Workflow).where(Workflow.is_active == True).order_by(Workflow.created_at.desc())
+    result = await db.execute(stmt)
+    workflows = result.scalars().all()
+    
+    return [
+        {
+            "workflow_id": str(w.id),
+            "name": w.name,
+            "description": w.description,
+            "nodes": json.loads(w.nodes) if w.nodes else [],
+            "edges": json.loads(w.edges) if w.edges else [],
+            "created_at": w.created_at.isoformat() if w.created_at else None
+        }
+        for w in workflows
+    ]
+
+
+@router.get("/workflows/{workflow_id}")
+async def get_workflow(workflow_id: str, db: AsyncSession = Depends(get_db)):
+    """获取工作流详情"""
+    stmt = select(Workflow).where(Workflow.id == uuid.UUID(workflow_id))
+    result = await db.execute(stmt)
+    workflow = result.scalar_one_or_none()
+    
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    
+    return {
+        "workflow_id": str(workflow.id),
+        "name": workflow.name,
+        "description": workflow.description,
+        "nodes": json.loads(workflow.nodes) if workflow.nodes else [],
+        "edges": json.loads(workflow.edges) if workflow.edges else [],
+        "created_at": workflow.created_at.isoformat() if workflow.created_at else None
+    }
+
+
+@router.post("/workflows/execute")
+async def execute_workflow(
+    req: WorkflowExecuteRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """执行工作流"""
+    from app.services.workflow import execute_workflow_background
+    
+    # 验证工作流存在
+    stmt = select(Workflow).where(Workflow.id == uuid.UUID(req.workflow_id))
+    result = await db.execute(stmt)
+    workflow = result.scalar_one_or_none()
+    
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    
+    new_execution = WorkflowExecution(
+        id=uuid.uuid4(),
+        workflow_id=uuid.UUID(req.workflow_id),
+        user_id=None,
+        input_file_ids=[uuid.UUID(fid) for fid in req.input_file_ids],
+        status="pending"
+    )
+    
+    db.add(new_execution)
+    await db.commit()
+    await db.refresh(new_execution)
+    
+    background_tasks.add_task(execute_workflow_background, str(new_execution.id))
+    
+    return {"execution_id": str(new_execution.id), "status": new_execution.status}
+
+
+@router.get("/workflows/executions/{execution_id}")
+async def get_workflow_execution(execution_id: str, db: AsyncSession = Depends(get_db)):
+    """获取工作流执行状态"""
+    stmt = select(WorkflowExecution).where(WorkflowExecution.id == uuid.UUID(execution_id))
+    result = await db.execute(stmt)
+    execution = result.scalar_one_or_none()
+    
+    if not execution:
+        raise HTTPException(status_code=404, detail="Execution not found")
+    
+    node_results = None
+    if execution.node_results:
+        try:
+            node_results = json.loads(execution.node_results)
+        except:
+            pass
+    
+    return {
+        "execution_id": str(execution.id),
+        "workflow_id": str(execution.workflow_id),
+        "status": execution.status,
+        "current_node": execution.current_node,
+        "node_results": node_results,
+        "output_file_id": str(execution.output_file_id) if execution.output_file_id else None,
+        "error": execution.error_message,
+        "created_at": execution.created_at.isoformat() if execution.created_at else None
+    }
+
+
+# ==================== 音频转录 API ====================
+
+class TranscriptionRequest(BaseModel):
+    audio_file_id: str
+    generate_minutes: bool = True  # 是否生成会议纪要
+    ai_model: str | None = None
+
+class TranscriptionResponse(BaseModel):
+    transcription_id: str
+    status: str
+
+
+@router.post("/transcriptions/create", response_model=TranscriptionResponse)
+async def create_transcription(
+    req: TranscriptionRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """创建音频转录任务"""
+    from app.services.workflow import process_transcription_background
+    
+    new_transcription = AudioTranscription(
+        id=uuid.uuid4(),
+        user_id=None,
+        audio_file_id=uuid.UUID(req.audio_file_id),
+        ai_model=req.ai_model,
+        status="pending"
+    )
+    
+    db.add(new_transcription)
+    await db.commit()
+    await db.refresh(new_transcription)
+    
+    background_tasks.add_task(
+        process_transcription_background, 
+        str(new_transcription.id), 
+        req.generate_minutes,
+        req.ai_model
+    )
+    
+    return TranscriptionResponse(
+        transcription_id=str(new_transcription.id), 
+        status=new_transcription.status
+    )
+
+
+@router.get("/transcriptions/{transcription_id}")
+async def get_transcription(transcription_id: str, db: AsyncSession = Depends(get_db)):
+    """获取转录结果"""
+    stmt = select(AudioTranscription).where(AudioTranscription.id == uuid.UUID(transcription_id))
+    result = await db.execute(stmt)
+    transcription = result.scalar_one_or_none()
+    
+    if not transcription:
+        raise HTTPException(status_code=404, detail="Transcription not found")
+    
+    speakers = None
+    action_items = None
+    if transcription.speakers:
+        try:
+            speakers = json.loads(transcription.speakers)
+        except:
+            pass
+    if transcription.action_items:
+        try:
+            action_items = json.loads(transcription.action_items)
+        except:
+            pass
+    
+    return {
+        "transcription_id": str(transcription.id),
+        "audio_file_id": str(transcription.audio_file_id),
+        "status": transcription.status,
+        "transcript": transcription.transcript,
+        "speakers": speakers,
+        "summary": transcription.summary,
+        "action_items": action_items,
+        "result_file_id": str(transcription.result_file_id) if transcription.result_file_id else None,
+        "error": transcription.error_message,
+        "created_at": transcription.created_at.isoformat() if transcription.created_at else None
+    }
+
+
+@router.get("/transcriptions")
+async def list_transcriptions(db: AsyncSession = Depends(get_db)):
+    """获取所有转录任务"""
+    stmt = select(AudioTranscription).order_by(AudioTranscription.created_at.desc())
+    result = await db.execute(stmt)
+    transcriptions = result.scalars().all()
+    
+    return [
+        {
+            "transcription_id": str(t.id),
+            "audio_file_id": str(t.audio_file_id),
+            "status": t.status,
+            "result_file_id": str(t.result_file_id) if t.result_file_id else None,
+            "created_at": t.created_at.isoformat() if t.created_at else None
+        }
+        for t in transcriptions
+    ]

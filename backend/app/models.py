@@ -54,3 +54,72 @@ class TemplateLibrary(Base):
     tags = Column(ARRAY(String))
     usage_count = Column(Integer, default=0)
     is_system = Column(Boolean, default=False)
+
+
+class DocumentReview(Base):
+    """文档审查记录"""
+    __tablename__ = "document_reviews"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), nullable=True)
+    document_id = Column(UUID(as_uuid=True), nullable=False)
+    review_type = Column(String(50))  # legal, compliance, risk, general
+    status = Column(String(50), default="pending")  # pending, processing, completed, failed
+    annotations = Column(Text, nullable=True)  # JSON 格式的批注列表
+    summary = Column(Text, nullable=True)  # 审查总结
+    risk_level = Column(String(20), nullable=True)  # low, medium, high, critical
+    ai_model = Column(String(100), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class Workflow(Base):
+    """工作流定义"""
+    __tablename__ = "workflows"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), nullable=True)
+    name = Column(String(255))
+    description = Column(Text, nullable=True)
+    nodes = Column(Text)  # JSON 格式的节点定义
+    edges = Column(Text)  # JSON 格式的边定义
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class WorkflowExecution(Base):
+    """工作流执行记录"""
+    __tablename__ = "workflow_executions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workflow_id = Column(UUID(as_uuid=True), nullable=False)
+    user_id = Column(UUID(as_uuid=True), nullable=True)
+    input_file_ids = Column(ARRAY(UUID(as_uuid=True)))
+    status = Column(String(50), default="pending")  # pending, running, completed, failed, cancelled
+    current_node = Column(String(100), nullable=True)
+    node_results = Column(Text, nullable=True)  # JSON 格式的每个节点执行结果
+    output_file_id = Column(UUID(as_uuid=True), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class AudioTranscription(Base):
+    """音频转录记录"""
+    __tablename__ = "audio_transcriptions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), nullable=True)
+    audio_file_id = Column(UUID(as_uuid=True), nullable=False)
+    status = Column(String(50), default="pending")  # pending, processing, completed, failed
+    transcript = Column(Text, nullable=True)  # 原始转录文本
+    speakers = Column(Text, nullable=True)  # JSON 格式的说话人分离结果
+    summary = Column(Text, nullable=True)  # 会议纪要摘要
+    action_items = Column(Text, nullable=True)  # JSON 格式的行动项
+    result_file_id = Column(UUID(as_uuid=True), nullable=True)  # 生成的会议纪要文档
+    ai_model = Column(String(100), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
