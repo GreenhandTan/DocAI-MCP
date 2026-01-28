@@ -1,16 +1,14 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref } from "vue";
 import axios from "axios";
 import {
   Mic,
   Upload,
   Play,
-  Pause,
   Loader2,
   FileText,
   CheckCircle,
   XCircle,
-  Users,
   ListChecks,
   Download,
 } from "lucide-vue-next";

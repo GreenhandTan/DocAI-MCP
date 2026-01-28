@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from "vue";
+import { ref, onMounted } from "vue";
 import axios from "axios";
 import {
   Play,
@@ -12,8 +12,6 @@ import {
   Mic,
   ArrowRight,
   Loader2,
-  CheckCircle,
-  XCircle,
   Save,
 } from "lucide-vue-next";
 
@@ -48,7 +46,6 @@ const props = defineProps<{
 }>();
 
 const workflows = ref<Workflow[]>([]);
-const selectedWorkflow = ref<Workflow | null>(null);
 const isLoading = ref(false);
 const isSaving = ref(false);
 const isExecuting = ref(false);
@@ -126,7 +123,7 @@ const saveWorkflow = async () => {
   
   isSaving.value = true;
   try {
-    const response = await axios.post("/api/v1/workflows/create", {
+    await axios.post("/api/v1/workflows/create", {
       name: newWorkflowName.value,
       description: newWorkflowDescription.value,
       nodes: editingNodes.value,
