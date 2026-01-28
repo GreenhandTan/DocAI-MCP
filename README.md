@@ -1,217 +1,113 @@
 # DocAI-MCP 智能文档编排系统
 
-基于 AI 的智能文档处理系统，支持文档上传、AI 驱动的排版和内容填充、在线编辑与修改。
+DocAI-MCP 是一个面向“文档上传 → AI 总结/填充 → 在线编辑 → 迭代修改”的一体化系统，内置 MCP（Model Context Protocol）工具链，用于把文档处理能力模块化编排到任务/工作流里。
 
-## 功能特性
+- 作者：Tan Xin（greenhandtan）
+- 博客：https://greenhandtan.top
 
-### 核心功能
-- 文档上传与管理
-- 预置模板库（简历、报告、合同、会议纪要等）
-- AI 智能处理文档排版和内容填充
-- OnlyOffice 在线编辑器集成
-- 支持迭代修改文档
-- 实时任务进度跟踪
+## 当前系统能力概览（基于仓库现状）
 
-### 高级功能 (v2.0 新增)
+### 已实现的核心能力
+- **文档管理**：上传/列表/下载（MinIO 对象存储 + PostgreSQL 元数据）  
+- **聊天式处理（SSE 流式）**：前端本地保存会话历史，后端以 SSE 方式流式转发模型输出  
+- **模板总结/按模板输出**
+  - 预置模板类型：简历/报告/会议纪要/合同/提案
+  - 自定义模板：支持上传模板文件（doc/docx）或直接粘贴“长文本模板描述”（会自动压缩成可执行模板后注入提示词）
+- **异步任务编排**：创建任务 → 后台调用 MCP 工具链执行 → 产出新文档并回传 fileId
+- **OnlyOffice 在线编辑**：在线预览/编辑 docx，保存回调可回写 MinIO；支持配置中文界面（`ONLYOFFICE_LANG=zh-CN`）
 
-#### AI 审查员
-- **法律审查**: 识别合同条款风险、权利义务不对等问题
-- **合规审查**: 检查法规合规性、数据隐私条款
-- **风险评估**: 综合分析财务、运营、声誉风险
-- **智能批注**: AI 自动标注问题位置并提供修改建议
+### 扩展功能（/features 页面）
+- **AI 审查**：通用/法律/合规/风险（后端创建审查任务，后台调 MCP `document_reviewer`）
+- **工作流编排**：可创建并执行 DAG 工作流，支持执行状态查询（当前以 API 为主，前端提供基础编辑/执行 UI）
+- **语音转会议纪要**：API 与前端流程已接入；但 MCP 侧 ASR 在未配置 `WHISPER_API_URL` 时为演示模式（仅返回提示，不会真实转录）
 
-#### 工作流编排
-- **可视化编排**: 拖拽式创建自动化处理流程
-- **DAG 执行引擎**: 支持复杂的节点依赖关系
-- **预置节点**: 内容提取、文档分析、AI 处理、文档生成等
-- **状态追踪**: 实时查看工作流执行进度
-
-#### 语音转会议纪要
-- **音频上传**: 支持 MP3、WAV、M4A 等格式
-- **智能转录**: 集成 ASR 服务自动转录
-- **纪要生成**: 自动提取议题、决议、待办事项
-- **文档输出**: 一键生成结构化会议纪要文档
-
-## 快速开始
-
-### 前置要求
-
-- Docker 和 Docker Compose
-- 至少 4GB 可用内存
-
-### 部署步骤
-
-1. 进入部署目录：
-
-```bash
-cd deploy
-```
-
-2. 确认 `.env` 配置文件存在并已配置（已预配置）
-
-3. 运行部署脚本：
-
-```bash
-./deploy.sh
-```
-
-4. 等待所有服务启动完成（约 2-3 分钟）
-
-5. 访问系统：
-   - 前端界面: http://localhost:3000
-   - 后端 API: http://localhost:8000
-   - MinIO 控制台: http://localhost:9001 (admin/password123)
-   - OnlyOffice: http://localhost:8081
-
-## 使用说明
-
-### 1. 上传文档
-
-- 在左侧边栏点击"上传文档"
-- 选择内容文档（可多选）
-- 可选择模板文档（可选）
-
-### 2. 选择模板
-
-- 从模板库中选择预置模板
-- 或上传自定义模板文档
-
-### 3. 发送需求
-
-- 在聊天界面输入处理需求
-- 例如："请帮我整理这份文档的格式"
-- AI 会自动创建处理任务
-
-### 4. 预览与编辑
-
-- 任务完成后，点击"预览"按钮查看结果
-- 在右侧编辑器中在线编辑文档
-- 编辑会自动保存到 MinIO
-
-### 5. 迭代修改
-
-- 点击"修改结果"按钮进入修改模式
-- 输入修改要求
-- AI 会基于当前文档进行修改
-
-### 6. 下载文档
-
-- 在文档列表中点击"下载"按钮
-- 或在编辑器中下载
-
-## 服务管理
-
-### 查看日志
-
-```bash
-# 查看所有服务日志
-docker-compose logs -f
-
-# 查看特定服务日志
-docker-compose logs -f backend
-docker-compose logs -f mcp-server
-docker-compose logs -f frontend
-```
-
-### 停止服务
-
-```bash
-docker-compose down
-```
-
-### 重启服务
-
-```bash
-docker-compose restart [service_name]
-```
-
-### 清理数据
-
-```bash
-# 停止并删除所有容器和数据卷
-docker-compose down -v
-```
+### 重要说明（影响体验/预期）
+- **上下文与二次总结**：聊天上下文由前端本地（localStorage）保存，后端不存会话；只要不清理浏览器存储即可多轮迭代。
+- **二次读取 404**：如果每次部署都 `down -v` 会清空 Postgres/MinIO 数据卷，旧的 `fileId` 将失效。部署脚本已调整为默认不清空数据卷。
 
 ## 技术架构
 
-- **前端**: Vue 3 + TypeScript + TailwindCSS
-- **后端**: FastAPI + SQLAlchemy + PostgreSQL
-- **对象存储**: MinIO
-- **文档编辑**: OnlyOffice Document Server
-- **AI 服务**: 智谱 AI (GLM-4.5-Air)
-- **消息队列**: Redis
-- **MCP 协议**: Model Context Protocol
+- **前端**：Vue 3 + TypeScript + TailwindCSS（nginx 静态部署）
+- **后端**：FastAPI + SQLAlchemy + PostgreSQL
+- **对象存储**：MinIO（uploads/outputs buckets）
+- **文档编辑**：OnlyOffice Document Server（JWT + callback 回写）
+- **任务/缓存**：Redis
+- **MCP 工具服务**：mcp-server（FastAPI + FastMCP），封装 content_extractor / template_matcher / document_generator / document_modifier 等工具
+- **AI 服务**：OpenAI-compatible Chat Completions（由 `AI_API_BASE_URL` 配置，支持多模型）
+
+## 快速开始（Docker 一键部署）
+
+### 前置要求
+- Docker Desktop / Docker Engine
+- Docker Compose（`docker compose` 或 `docker-compose`）
+
+### 启动
+在项目根目录执行：
+
+```bash
+bash deploy/deploy.sh
+```
+
+等待容器启动后访问：
+- 前端：http://localhost:3000
+- 后端 API：http://localhost:8000
+- MinIO 控制台：http://localhost:9001
+- OnlyOffice：http://localhost:8081
+
+### 数据是否保留（非常重要）
+部署脚本默认不会删除数据卷（避免重启/重建后文件丢失导致 404）。如需清理全部数据：
+
+```bash
+RESET_VOLUMES=1 bash deploy/deploy.sh
+```
+
+Windows 下对应：
+```bat
+set RESET_VOLUMES=1
+deploy\deploy.bat
+```
+
+## 配置说明（deploy/.env）
+
+### AI 相关（必须）
+- `AI_API_KEY`：上游模型服务 key
+- `AI_API_BASE_URL`：上游 OpenAI-compatible 地址（支持基础路径或完整 `/chat/completions`）
+- `AI_MODEL_NAME`：默认模型名（前端也可选择模型）
+
+### OnlyOffice 相关
+- `ONLYOFFICE_API_URL`：后端用于回调/联通 OnlyOffice 的内部地址
+- `ONLYOFFICE_PUBLIC_URL`：前端加载 DocsAPI 的地址（如需要改域名/反代）
+- `ONLYOFFICE_LANG`：OnlyOffice 界面语言（默认 `zh-CN`）
+
+### 存储/数据库
+- `MINIO_*` / `POSTGRES_*` / `REDIS_URL`：基础设施配置
+
+## 使用指南（推荐工作流）
+
+1) 上传文档（PDF/DOCX/TXT）  
+2) 选择模板：
+   - 预置模板：直接点选
+   - 自定义模板（文件）：上传 doc/docx
+   - 自定义模板（文本）：粘贴模板描述，适合“很长的规范/格式要求”
+3) 在聊天框描述需求（可多轮迭代），系统将：
+   - 在聊天中给出总结/结构化输出（带上下文）
+   - 若选择了文件/模板操作，会创建后台任务并产出新文档
+4) 任务完成后，可进入 OnlyOffice 在线编辑并下载
 
 ## 项目结构
 
 ```
 DocAI-MCP/
-├── backend/           # FastAPI 后端服务
-├── frontend/          # Vue 3 前端应用
-├── mcp-server/        # MCP 协议服务端
-└── deploy/            # 部署配置
-    ├── .env          # 环境配置
-    ├── docker-compose.yml
-    └── deploy.sh     # 部署脚本
+├── backend/            # FastAPI 后端服务
+├── frontend/           # Vue 3 前端应用
+├── mcp-server/         # MCP 工具服务端（FastMCP + FastAPI）
+└── deploy/             # Docker Compose 与一键脚本
 ```
 
-## 常见问题
+## 许可证与署名要求
 
-### Q: 服务启动失败怎么办？
+本项目采用 MIT License（见 [LICENSE](./LICENSE)）。
 
-A: 检查端口是否被占用，确保 3000、8000、8081、9000、9001、5432、6379 端口可用。
-
-### Q: AI 响应很慢？
-
-A: 智谱 AI 的响应速度取决于网络和 API 限制，请耐心等待。
-
-### Q: OnlyOffice 加载失败？
-
-A: 确保 OnlyOffice 服务已启动，检查 http://localhost:8081 是否可访问。
-
-### Q: 如何更换 AI 模型？
-
-A: 修改 `deploy/.env` 文件中的 `AI_MODEL_NAME` 和 `AI_API_KEY`。
-
-## 开发说明
-
-### 本地开发
-
-1. 启动基础设施服务：
-
-```bash
-cd deploy
-docker-compose up -d postgres redis minio onlyoffice
-```
-
-2. 启动后端：
-
-```bash
-cd ../backend
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-
-3. 启动 MCP Server：
-
-```bash
-cd ../mcp-server
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python server.py
-```
-
-4. 启动前端：
-
-```bash
-cd ../frontend
-npm install
-npm run dev
-```
-
-## 许可证
-
-MIT License
+你可以自由商用、二次开发、分发与转载；但必须：
+- **保留 LICENSE 与版权声明**
+- 在你的产品/文档/发行说明中**注明原作者：Tan Xin（greenhandtan）**并附上博客链接：https://greenhandtan.top
