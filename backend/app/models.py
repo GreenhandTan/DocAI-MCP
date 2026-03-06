@@ -8,10 +8,16 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    email = Column(String(255), unique=True, index=True)
-    subscription_tier = Column(String(50), default="free")
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    username = Column(String(100), nullable=True)
+    subscription_tier = Column(String(50), default="free")  # free, pro, enterprise
     storage_quota = Column(BigInteger, default=1073741824) # 1GB
+    storage_used = Column(BigInteger, default=0)
+    is_active = Column(Boolean, default=True)
+    is_admin = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_login = Column(DateTime(timezone=True), nullable=True)
 
 class Document(Base):
     __tablename__ = "documents"
@@ -123,3 +129,49 @@ class AudioTranscription(Base):
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class DocumentVersion(Base):
+    """文档版本历史"""
+    __tablename__ = "document_versions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    document_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    version_number = Column(Integer, nullable=False)
+    minio_path = Column(String(500), nullable=False)
+    file_size = Column(BigInteger, nullable=False)
+    change_description = Column(Text, nullable=True)
+    created_by = Column(UUID(as_uuid=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class WebhookConfig(Base):
+    """Webhook 配置"""
+    __tablename__ = "webhook_configs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    url = Column(String(500), nullable=False)
+    events = Column(ARRAY(String), nullable=False)  # task_completed, document_uploaded, review_completed, etc.
+    is_active = Column(Boolean, default=True)
+    secret = Column(String(255), nullable=True)  # 用于签名验证
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_triggered = Column(DateTime(timezone=True), nullable=True)
+
+
+class SystemStats(Base):
+    """系统统计数据（按天汇总）"""
+    __tablename__ = "system_stats"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    date = Column(DateTime(timezone=True), nullable=False, unique=True, index=True)
+    total_users = Column(Integer, default=0)
+    active_users = Column(Integer, default=0)
+    total_documents = Column(Integer, default=0)
+    total_tasks = Column(Integer, default=0)
+    completed_tasks = Column(Integer, default=0)
+    failed_tasks = Column(Integer, default=0)
+    storage_used = Column(BigInteger, default=0)
+    ai_calls = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

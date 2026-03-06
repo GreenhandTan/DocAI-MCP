@@ -34,7 +34,11 @@ class Settings(BaseSettings):
     ONLYOFFICE_API_URL: str # Internal URL for backend callbacks
     ONLYOFFICE_PUBLIC_URL: str | None = None # Public URL for frontend JS
     ONLYOFFICE_LANG: str = "zh-CN"
+    
+    # JWT Authentication
     JWT_SECRET: str
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 10080  # 7 天
     
     # AI Config
     AI_API_KEY: str | None = None

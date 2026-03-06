@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
-from app.api import endpoints, onlyoffice
+from app.api import endpoints, onlyoffice, auth, templates, extended
 from app.database import engine, Base
 
 settings = get_settings()
@@ -22,8 +22,11 @@ app.add_middleware(
 )
 
 # Routes
+app.include_router(auth.router, prefix=settings.API_V1_STR)
 app.include_router(endpoints.router, prefix=settings.API_V1_STR)
 app.include_router(onlyoffice.router, prefix=settings.API_V1_STR)
+app.include_router(templates.router, prefix=settings.API_V1_STR)
+app.include_router(extended.router, prefix=settings.API_V1_STR)
 
 @app.on_event("startup")
 async def startup():

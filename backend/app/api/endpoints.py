@@ -1,12 +1,13 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Form, Request
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Form, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update
 from app.database import get_db
-from app.models import Document, ProcessingTask, DocumentReview, Workflow, WorkflowExecution, AudioTranscription
+from app.models import Document, ProcessingTask, DocumentReview, Workflow, WorkflowExecution, AudioTranscription, User, DocumentVersion
 from app.services.minio_client import minio_client
 from app.services.workflow import process_task_background
 from app.core.config import get_settings
+from app.core.auth import get_current_user_optional, get_current_user
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 import uuid
@@ -14,6 +15,7 @@ import os
 from urllib.parse import quote
 import httpx
 import json
+import datetime
 
 router = APIRouter()
 settings = get_settings()
@@ -91,9 +93,20 @@ def _resolve_model(requested_model: str | None) -> str:
 async def upload_file(
     file: UploadFile = File(...),
     is_template: bool = Form(False),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = Depends(get_current_user_optional)
 ):
     file_content = await file.read()
+    file_size = len(file_content)
+    
+    # 存储配额检查（仅认证用户）
+    if current_user:
+        if current_user.storage_used + file_size > current_user.storage_quota:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Storage quota exceeded. Used: {current_user.storage_used}, Quota: {current_user.storage_quota}"
+            )
+    
     file_ext = os.path.splitext(file.filename)[1]
     storage_filename = f"{uuid.uuid4()}{file_ext}"
     
@@ -105,9 +118,9 @@ async def upload_file(
     
     new_doc = Document(
         id=uuid.uuid4(),
-        user_id=None,
+        user_id=current_user.id if current_user else None,
         filename=file.filename,
-        file_size=len(file_content),
+        file_size=file_size,
         mime_type=file.content_type,
         minio_path=minio_path,
         status="uploaded",
@@ -115,6 +128,11 @@ async def upload_file(
     )
     
     db.add(new_doc)
+    
+    # 更新用户存储使用量
+    if current_user:
+        current_user.storage_used += file_size
+    
     await db.commit()
     await db.refresh(new_doc)
     
@@ -212,8 +230,16 @@ async def modify_document(
     return TaskResponse(task_id=str(new_task.id), status=new_task.status)
 
 @router.get("/files", response_model=list[DocumentResponse])
-async def list_files(db: AsyncSession = Depends(get_db)):
-    stmt = select(Document).order_by(Document.created_at.desc())
+async def list_files(
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = Depends(get_current_user_optional)
+):
+    # 如果用户已登录，只显示用户自己的文件；否则显示所有公开文件（暂时显示所有）
+    if current_user:
+        stmt = select(Document).where(Document.user_id == current_user.id).order_by(Document.created_at.desc())
+    else:
+        stmt = select(Document).where(Document.user_id == None).order_by(Document.created_at.desc())
+    
     result = await db.execute(stmt)
     docs = result.scalars().all()
     return [
@@ -227,6 +253,56 @@ async def list_files(db: AsyncSession = Depends(get_db)):
         )
         for d in docs
     ]
+
+
+@router.delete("/files/{file_id}")
+async def delete_file(
+    file_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User | None = Depends(get_current_user_optional)
+):
+    """删除文件"""
+    stmt = select(Document).where(Document.id == uuid.UUID(file_id))
+    result = await db.execute(stmt)
+    doc = result.scalar_one_or_none()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # 权限检查：仅文件所有者或管理员可以删除
+    if current_user:
+        if doc.user_id != current_user.id and not current_user.is_admin:
+            raise HTTPException(status_code=403, detail="Permission denied")
+    elif doc.user_id is not None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    # 从 MinIO 删除文件
+    try:
+        bucket = settings.MINIO_BUCKET_UPLOADS
+        object_name = doc.minio_path
+        if "/" in doc.minio_path:
+            prefix, rest = doc.minio_path.split("/", 1)
+            if prefix in [settings.MINIO_BUCKET_OUTPUTS, "outputs"]:
+                bucket = settings.MINIO_BUCKET_OUTPUTS
+                object_name = rest
+            elif prefix in [settings.MINIO_BUCKET_UPLOADS, "uploads"]:
+                object_name = rest
+        object_name = object_name.split("/")[-1]
+        
+        await run_in_threadpool(minio_client.client.remove_object, bucket, object_name)
+    except Exception as e:
+        # 即使 MinIO 删除失败，也继续删除数据库记录
+        print(f"Failed to delete from MinIO: {e}")
+    
+    # 更新用户存储使用量
+    if current_user and doc.user_id == current_user.id:
+        current_user.storage_used = max(0, current_user.storage_used - (doc.file_size or 0))
+    
+    # 删除数据库记录
+    await db.delete(doc)
+    await db.commit()
+    
+    return {"message": "File deleted successfully", "file_id": file_id}
 
 @router.get("/tasks", response_model=list[TaskListItem])
 async def list_tasks(db: AsyncSession = Depends(get_db)):
